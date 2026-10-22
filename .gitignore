@@ -1,0 +1,29 @@
+# Build and release output
+bin*/
+obj*/
+build*/
+publish/
+releases/
+*.obj
+*.pdb
+*.exp
+*.lib
+*.dll
+*.exe
+
+# Local settings, traces, replays, reports and optional game assets
+review_settings*.json
+*.rep
+*.csv
+*.log
+*-check.json
+escape-check.json
+interpretation-check.json
+CardArt.zip
+art/
+escape_worker_game/
+performance_checks/
+handoff_backups/
+v1.0/
+.vs/
+.idea/
