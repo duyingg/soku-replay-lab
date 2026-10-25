@@ -1,4 +1,4 @@
-using Microsoft.Win32;
+﻿using Microsoft.Win32;
 using System.Data;
 using System.Globalization;
 using System.IO;
@@ -34,9 +34,11 @@ public sealed partial class MainWindow : Window
     private readonly StackPanel navigation = new();
     private readonly StackPanel content = new();
     private sealed record CachedPage(UIElement[] Children, object? Toolbar,
-        ReplaySession? Session, int SampleCount);
+        ReplaySession? Session, ReplaySession[] Samples, int PressureMoves);
     private readonly Dictionary<int, CachedPage> pageCache = [];
     private bool navigationRender;
+    private string? navigationShape;
+    private readonly List<(int Page, Button Button, TextBlock Icon, TextBlock Name)> navigationButtons = [];
     private readonly TextBlock connection = new();
     private Grid? shellGrid;
     private DockPanel? mainDock;
@@ -53,7 +55,6 @@ public sealed partial class MainWindow : Window
     private readonly DispatcherTimer playbackTimer = new() { Interval = TimeSpan.FromMilliseconds(50) };
     private readonly DispatcherTimer liveTimer = new() { Interval = TimeSpan.FromMilliseconds(250) };
     private readonly DispatcherTimer probeTimer = new() { Interval = TimeSpan.FromMilliseconds(200) };
-    private readonly DispatcherTimer inputTimer = new() { Interval = TimeSpan.FromSeconds(ReplayTiming.SecondsPerFrame) };
     private Slider? replaySlider;
     private Button? transportPlayButton;
     private TextBlock? transportTimeLabel;
@@ -62,7 +63,6 @@ public sealed partial class MainWindow : Window
     private bool updatingTransport;
     private TextBlock? liveStatusLabel;
     private TextBlock? probeStatusLabel;
-    private TextBlock? recorderStatusLabel;
     private TextBlock? escapeProgressLabel;
     private LiveGameReader? liveReader;
     private LiveGameStatus? liveStatus;
@@ -77,7 +77,6 @@ public sealed partial class MainWindow : Window
     private ContentControl? replaySnapshotContent;
     private ContentControl? replayQuickContent;
     private ContentControl? replayBookmarksContent;
-    private Button? replayPlayButton;
     private WrapPanel? replayP1Hand;
     private WrapPanel? replayP2Hand;
     private TextBlock? replayPictureTitle;
@@ -101,25 +100,15 @@ public sealed partial class MainWindow : Window
     private string? launchedGameExe;
     private int managedGamePid = -1;
     private string? managedGameExe;
-    private EscapeWorkerGame? escapeWorker;
-    private Task<EscapeWorkerGame>? pendingEscapeWorker;
     internal bool SmokeDisableEscapeWorker { get; set; }
-    private bool recordingInput, branchBusy, escapeBusy, escapeBatchCancelRequested,
+    private bool branchBusy, escapeBusy,
         fullCaptureBusy, fullCaptureCancelRequested, sessionLoading;
     private bool escapeOnlySuccess;
     private int escapeBatchDone, escapeBatchTotal;
-    private int recordingSide, branchAnchor;
-    private readonly List<ushort> recordedInput = [];
-    private ReplaySession? recordingOriginal;
-    private int recordingAnchor;
+    private int branchAnchor;
     private ReplaySession? branchOriginal;
     private readonly List<EscapeTrialResult> escapeResults = [];
     private EscapeTrialResult? selectedEscapeResult;
-    private ProbeClient? cachedEscapeProbe;
-    private string? cachedEscapeHash;
-    private ReplaySession? cachedEscapeBaseline;
-    private readonly Dictionary<(int Start, int NextContact, int Defender, string Move),
-        EscapeTrialResult> cachedEscapeTrials = [];
     private int escapeDefender = -1;
     private string escapeMove = "4A";
     private readonly HashSet<string> addedEscapeMoves = [];
@@ -129,6 +118,9 @@ public sealed partial class MainWindow : Window
     private double playbackRemainder;
     private readonly Stopwatch playbackClock = new();
     private readonly Dictionary<string, ReplayPanelLayout> replayPanelLayouts = [];
+    private ReplayDockState? replayDockState;
+    private ReplayDockState? replayDockDefaultState;
+    private readonly Dictionary<string, ReplayDockState> replayDockWorkspaces = [];
     private string? gameDirectory;
     private string? replayDirectory;
     private int gapThreshold = -1;
@@ -177,13 +169,10 @@ public sealed partial class MainWindow : Window
         playbackTimer.Tick += (_, _) => AdvancePlayback();
         liveTimer.Tick += (_, _) => RefreshLiveStatus();
         probeTimer.Tick += (_, _) => RefreshProbeStatus();
-        inputTimer.Tick += (_, _) => CaptureInputFrame();
-        PreviewKeyDown += (_, e) => { if (recordingInput && IsRecordKey(e.Key)) e.Handled = true; };
-        PreviewKeyUp += (_, e) => { if (recordingInput && IsRecordKey(e.Key)) e.Handled = true; };
         Closing += OnClosing;
         Closed += (_, _) => {
             gameFocusTimer.Stop(); gameKeyboardFocus?.Dispose(); gameKeyboardFocus = null;
-            playbackTimer.Stop(); liveTimer.Stop(); probeTimer.Stop(); inputTimer.Stop();
+            playbackTimer.Stop(); liveTimer.Stop(); probeTimer.Stop();
             liveReader?.Dispose(); probe?.Dispose();
         };
         PreviewMouseDown += (_, e) => { if (gameKeyboardFocus is not null) e.Handled = true; };
@@ -411,7 +400,8 @@ public sealed partial class MainWindow : Window
         foreach (var column in columns) data.Columns.Add(column);
         // The outer page owns scrolling. Materialize only the first viewport of
         // rows, then extend the table when its bottom approaches the viewport.
-        var loadedCount = Math.Min(allRows.Length, 40);
+        const int rowBatch = 20;
+        var loadedCount = Math.Min(allRows.Length, rowBatch);
         for (var i = 0; i < loadedCount; i++)
             data.Rows.Add(allRows[i]);
         var grid = new DataGrid {
@@ -476,8 +466,8 @@ public sealed partial class MainWindow : Window
                     loadedCount >= allRows.Length ||
                     pageScroller is null || pageScroller.ViewportHeight <= 0) return;
                 var bottom = grid.TranslatePoint(new Point(0, grid.ActualHeight), pageScroller).Y;
-                if (bottom < -320 || bottom > pageScroller.ViewportHeight + 320) return;
-                var end = Math.Min(allRows.Length, loadedCount + 40);
+                if (bottom < -96 || bottom > pageScroller.ViewportHeight + 96) return;
+                var end = Math.Min(allRows.Length, loadedCount + rowBatch);
                 appending = true;
                 try
                 {
@@ -638,9 +628,12 @@ public sealed partial class MainWindow : Window
             VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 14, 0) };
         replaySlider.ValueChanged += (_, _) => {
             if (updatingTransport || session?.Frames.Count is not > 0) return;
-            cursor = Math.Clamp((int)Math.Round(replaySlider.Value), 0, session.Frames.Count - 1);
-            UpdateTransportTime();
-            refreshReplayFrame?.Invoke();
+            if (probe is null && detectedGame is null)
+            {
+                cursor = Math.Clamp((int)Math.Round(replaySlider.Value), 0, session.Frames.Count - 1);
+                UpdateTransportTime();
+                refreshReplayFrame?.Invoke();
+            }
         };
         replaySlider.PreviewMouseLeftButtonUp += (_, _) => CommitTransportSeek();
         replaySlider.KeyUp += (_, e) => {
@@ -675,8 +668,7 @@ public sealed partial class MainWindow : Window
     private void CommitTransportSeek()
     {
         if (session?.Frames.Count is not > 0) return;
-        if (probeStatus?.Status is 2 or 3) SeekGameAt(cursor);
-        else if (page != 0) Render();
+        SeekGameAt((int)Math.Round(replaySlider?.Value ?? cursor));
     }
     private void UpdateTransportTime()
     {
@@ -686,29 +678,34 @@ public sealed partial class MainWindow : Window
     }
     private void UpdateTransport()
     {
+        replayWorkspace?.UpdateEditAvailability();
         if (replaySlider is null) return;
         updatingTransport = true;
         try
         {
             var count = session?.Frames.Count ?? 0;
+            var canControlSession = (probe is null && detectedGame is null) || session?.Header is not null &&
+                string.Equals(System.IO.Path.GetExtension(session.Source), ".rep", StringComparison.OrdinalIgnoreCase);
             if (takeoverButton is not null) {
                 takeoverButton.IsEnabled = detectedGame is not null && gameKeyboardFocus is null &&
-                    !givingGameFocus && !fullCaptureBusy && !branchBusy && !escapeBusy && !recordingInput && !sessionLoading;
+                    !givingGameFocus && !returningGameFocus && !nativeTransportBusy &&
+                    !fullCaptureBusy && !branchBusy && !escapeBusy && !sessionLoading;
                 takeoverButton.Content = gameKeyboardFocus is null ? "接管" : $"接管中 · {ExitTakeoverKeyLabel} 退出";
             }
-            replaySlider.IsEnabled = count > 0 && !fullCaptureBusy && gameKeyboardFocus is null;
+            replaySlider.IsEnabled = count > 0 && canControlSession && !PlaybackOperationBlocked;
             replaySlider.Maximum = Math.Max(1, count - 1);
-            if (!replaySlider.IsMouseCaptureWithin)
+            if (!replaySlider.IsMouseCaptureWithin && pendingSeekTarget is null && !TakeoverTransition)
                 replaySlider.Value = count > 0 ? Math.Clamp(cursor, 0, count - 1) : 0;
             if (transportPlayButton is not null)
             {
-                transportPlayButton.IsEnabled = gameKeyboardFocus is null &&
+                transportPlayButton.IsEnabled = canControlSession && !PlaybackOperationBlocked && !nativeTransportBusy &&
                     (count > 0 || probeStatus?.Status is 2 or 3);
-                transportPlayButton.Content = probeStatus?.Status == 2 || playing ? "暂停" : "播放";
+                transportPlayButton.Content = NativeSessionMatches && probeStatus?.Status == 2 || playing ? "暂停" : "播放";
             }
             UpdateTransportTime();
             foreach (var (rate, control) in transportSpeeds)
             {
+                control.IsEnabled = canControlSession && !PlaybackOperationBlocked;
                 var selected = Math.Abs(playbackSpeed - rate) < .001;
                 control.Background = selected ? Blue : Surface;
                 control.Foreground = selected ? palette["OnAccent"] : TextColor;
@@ -719,6 +716,21 @@ public sealed partial class MainWindow : Window
     }
     private void BuildNavigation()
     {
+        var shape = expert + ":" + string.Join(',', enabled);
+        if (navigationShape == shape)
+        {
+            foreach (var item in navigationButtons)
+            {
+                var selected = item.Page == page;
+                item.Button.Background = selected ? Blue : Brushes.Transparent;
+                item.Button.Foreground = selected ? palette["OnAccent"] : palette["SidebarText"];
+                item.Icon.Foreground = selected ? palette["OnAccent"] : palette["SidebarAccent"];
+                item.Name.Foreground = selected ? palette["OnAccent"] : palette["SidebarText"];
+            }
+            return;
+        }
+        navigationShape = shape;
+        navigationButtons.Clear();
         navigation.Children.Clear();
         string? last = null;
         for (var i = 0; i < Pages.Length; i++)
@@ -749,6 +761,7 @@ public sealed partial class MainWindow : Window
                 Template = RoundedButtonTemplate()
             };
             button.Click += (_, _) => NavigateToPage(index);
+            navigationButtons.Add((index, button, (TextBlock)label.Children[0], name));
             navigation.Children.Add(button);
         }
     }
@@ -763,7 +776,7 @@ public sealed partial class MainWindow : Window
     private void Render()
     {
         if (gameKeyboardFocus is not null) { UpdateTopNotice(); return; }
-        if (!navigationRender) pageCache.Clear();
+        if (!navigationRender) pageCache.Remove(page);
         var watch = Stopwatch.StartNew();
         try { RenderCore(); }
         finally
@@ -781,14 +794,24 @@ public sealed partial class MainWindow : Window
             gameSurface.GameWindow == detectedGame.Window;
         if (navigationRender && renderedPage is > 0 and < 9 && renderedPage != page)
             pageCache[renderedPage] = new CachedPage(content.Children.Cast<UIElement>()
-                .Where(element => !parkedReplayElements.Contains(element)).ToArray(),
+                .Where(element => element.Visibility != Visibility.Collapsed &&
+                    !parkedReplayElements.Contains(element)).ToArray(),
                 renderedPage == 3 ? curveToolbarHost?.Content : null,
-                session, samples.Count);
-        if (page == 0 && parkedReplayElements.Count > 0 && SurfaceMatchesGame())
+                session, samples.ToArray(), minPressureMoves);
+        var retained = pageCache.Values.SelectMany(cached => cached.Children).ToHashSet();
+        void ClearPageContent()
         {
             for (var i = content.Children.Count - 1; i >= 0; i--)
-                if (!parkedReplayElements.Contains(content.Children[i]))
-                    content.Children.RemoveAt(i);
+            {
+                var element = content.Children[i];
+                if (parkedReplayElements.Contains(element)) continue;
+                if (retained.Contains(element)) element.Visibility = Visibility.Collapsed;
+                else content.Children.RemoveAt(i);
+            }
+        }
+        if (page == 0 && parkedReplayElements.Count > 0 && SurfaceMatchesGame())
+        {
+            ClearPageContent();
             foreach (var element in parkedReplayElements) element.Visibility = Visibility.Visible;
             parkedReplayElements.Clear();
             renderedPage = 0;
@@ -821,7 +844,8 @@ public sealed partial class MainWindow : Window
             parkedReplayElements.Count == 0 && SurfaceMatchesGame();
         if (parkReplay)
         {
-            parkedReplayElements.AddRange(content.Children.Cast<UIElement>());
+            parkedReplayElements.AddRange(content.Children.Cast<UIElement>()
+                .Where(element => !retained.Contains(element)));
             foreach (var element in parkedReplayElements) element.Visibility = Visibility.Collapsed;
         }
         else if (gameSurface is not null &&
@@ -842,11 +866,9 @@ public sealed partial class MainWindow : Window
             replayWorkspace = null;
             replayPlaybackContent = replaySnapshotContent = replayQuickContent =
                 replayBookmarksContent = null;
-            replayPlayButton = null;
             replayP1Hand = replayP2Hand = null;
             replayPictureTitle = null;
             refreshReplayFrame = null;
-            recorderStatusLabel = null;
             liveStatusLabel = null;
             probeStatusLabel = null;
         }
@@ -874,16 +896,19 @@ public sealed partial class MainWindow : Window
             replayFrameCountText.Text = page == 0 && session?.Header is not null
                 ? $"REP 输入记录 {session.Header.InputFrames:N0} 帧" : "";
         }
-        if (parkedReplayElements.Count == 0) content.Children.Clear();
-        else
-            for (var i = content.Children.Count - 1; i >= 0; i--)
-                if (!parkedReplayElements.Contains(content.Children[i]))
-                    content.Children.RemoveAt(i);
+        // Keep cached visual trees attached. Removing/readding a DataGrid
+        // recreates its row/cell containers even when the data was cached.
+        ClearPageContent();
         content.Margin = new Thickness(29, 12, 29, 22);
         if (navigationRender && pageCache.TryGetValue(page, out var cached) &&
-            ReferenceEquals(cached.Session, session) && cached.SampleCount == samples.Count)
+            ReferenceEquals(cached.Session, session) && cached.Samples.SequenceEqual(samples) &&
+            cached.PressureMoves == minPressureMoves)
         {
-            foreach (var element in cached.Children) content.Children.Add(element);
+            foreach (var element in cached.Children)
+            {
+                if (!content.Children.Contains(element)) content.Children.Add(element);
+                element.Visibility = Visibility.Visible;
+            }
             if (page == 3 && curveToolbarHost is not null)
             {
                 curveToolbarHost.Content = cached.Toolbar;
@@ -943,33 +968,12 @@ public sealed partial class MainWindow : Window
     private void Empty(string detail) => content.Children.Add(Card("当前状态", Text(detail, 13, Muted)));
     private void Jump(int ordinal)
     {
-        PausePlayback();
-        if (probe is not null && probeStatus?.Status == 3 &&
-            nativeSnapshotSlots.Contains(ordinal) && nativeSnapshotPid == probe.Pid &&
-            string.Equals(nativeSnapshotSource, session?.Source,
-                StringComparison.OrdinalIgnoreCase))
-        {
-            _ = RestoreNativeSnapshotAsync(ordinal);
-            return;
-        }
-        cursor = ordinal;
+        if (PlaybackOperationBlocked) return;
         page = 0;
         Render();
         SeekGameAt(ordinal);
     }
-    private async void SeekGameAt(int ordinal)
-    {
-        if (probe is null || probeStatus?.Status is not (2 or 3)) return;
-        try
-        {
-            if (ordinal < probeStatus.Ordinal) ClearNativeSnapshots();
-            probeStatus = await probe.SendAsync(ProbeCommand.Seek, target: ordinal);
-            await RefreshSessionFromProbe();
-            message = $"游戏回放已定位到轨迹帧 {probeStatus.Ordinal:N0}。";
-        }
-        catch (Exception ex) { message = $"游戏定位失败：{ex.Message}"; }
-        Render();
-    }
+    private void SeekGameAt(int ordinal) => _ = SeekPlaybackAsync(ordinal);
     private void PausePlayback()
     {
         playing = false;
@@ -979,7 +983,7 @@ public sealed partial class MainWindow : Window
     }
     private void AdvancePlayback()
     {
-        if (probeStatus?.Status is 2 or 3) { PausePlayback(); return; }
+        if (probe is not null || detectedGame is not null) { PausePlayback(); return; }
         if (!playing || session is null || session.Frames.Count == 0) { PausePlayback(); return; }
         var elapsed = playbackClock.Elapsed.TotalSeconds;
         playbackClock.Restart();
@@ -992,11 +996,8 @@ public sealed partial class MainWindow : Window
     }
     private void SeekRelative(int frames)
     {
-        if (session is null || session.Frames.Count == 0) return;
-        cursor = Math.Clamp(cursor + frames, 0, session.Frames.Count - 1);
-        if (replaySlider is not null) replaySlider.Value = cursor;
-        else Render();
-        if (probeStatus?.Status is 2 or 3) SeekGameAt(cursor);
+        if (session?.Frames.Count is not > 0) return;
+        SeekGameAt(Math.Clamp((pendingSeekTarget ?? cursor) + frames, 0, session.Frames.Count - 1));
     }
     private void TogglePlayback()
     {
@@ -1013,12 +1014,18 @@ public sealed partial class MainWindow : Window
             else _ = PlayEscapeResultAsync(result);
             return;
         }
-        if (probe is not null && probeStatus?.Status is 2 or 3)
+        if (probe is not null)
         {
-            PausePlayback();
-            ProbeCommandRun(probeStatus.Status == 2 ? ProbeCommand.Pause : ProbeCommand.Play);
+            _ = ToggleNativePlaybackAsync();
             return;
         }
+        if (detectedGame is not null)
+        {
+            message = "请先连接探针，播放控制才能与游戏画面同步。";
+            UpdateTopNotice();
+            return;
+        }
+        if (PlaybackOperationBlocked) return;
         if (playing) PausePlayback();
         else
         {
@@ -1117,10 +1124,20 @@ public sealed partial class MainWindow : Window
         replayQuickContent = new ContentControl();
         replayBookmarksContent = new ContentControl();
         PopulateReplayTools();
-        replayWorkspace = new ReplayWorkspace((id, layout) => {
+        ReplayWorkspace? workspace = null;
+        workspace = new ReplayWorkspace((id, layout) => {
+            if (!ReferenceEquals(replayWorkspace, workspace)) return;
             replayPanelLayouts[id] = layout;
+        }, (state, workspaces) => {
+            if (!ReferenceEquals(replayWorkspace, workspace)) return;
+            replayDockState = state;
+            replayDockDefaultState = workspace!.DefaultLayout;
+            replayDockWorkspaces.Clear();
+            foreach (var (name, saved) in workspaces) replayDockWorkspaces[name] = saved;
             SaveSettings();
-        });
+        }, replayDockState, replayDockWorkspaces,
+            () => !ReplayControlInFlight && !PlaybackOperationBlocked, Blue, replayDockDefaultState, TextColor, palette["OnAccent"]);
+        replayWorkspace = workspace;
         static bool Wide(double width) => width >= 920;
         static double MainWidth(double width) => Wide(width)
             ? Math.Max(540, Math.Round((width - 12) * .66)) : Math.Max(540, width);
@@ -1137,7 +1154,7 @@ public sealed partial class MainWindow : Window
             width => new ReplayPanelLayout(0, 0, MainWidth(width), 650));
         gamePanelFrame.SizeChanged += (_, _) => ApplyPictureSize();
         ApplyPictureSize();
-        Panel("playback", "播放与模拟", replayPlaybackContent, 300, 220,
+        Panel("playback", "压制缝提示", replayPlaybackContent, 300, 220,
             width => new ReplayPanelLayout(SideX(width), SideTop(width, 0),
                 SideWidth(width), 300));
         Panel("snapshot", "固定快照", replaySnapshotContent, 300, 180,
@@ -1149,6 +1166,7 @@ public sealed partial class MainWindow : Window
         Panel("bookmarks", "时间标记", replayBookmarksContent, 300, 160,
             width => new ReplayPanelLayout(SideX(width), SideTop(width, 806),
                 SideWidth(width), 180));
+        replayWorkspace.CompleteRegistration();
         content.Children.Add(replayWorkspace);
     }
     private void PopulateReplayFramePanel(StackPanel framePanel, StackPanel frameControls,
@@ -1165,8 +1183,10 @@ public sealed partial class MainWindow : Window
             var position = Text($"{Time(cursor)} / {Time(selectedSession.Frames.Count - 1)}", 12, Muted);
             var p1State = Text("", 12, TextColor);
             var p2State = Text("", 12, TextColor);
+            var renderedHands = new string?[2];
             void RefreshFrame()
             {
+                if (!ReferenceEquals(session, selectedSession)) return;
                 var frame = selectedSession.Frames[Math.Clamp(cursor, 0, selectedSession.Frames.Count - 1)];
                 if (replayPictureTitle is not null) replayPictureTitle.Text = $"轨迹位置 · {Time(cursor)}";
                 position.Text = $"{Time(cursor)} / {Time(selectedSession.Frames.Count - 1)}";
@@ -1174,9 +1194,12 @@ public sealed partial class MainWindow : Window
                     $"{ActionCatalog.Display(frame.P1.Action, frame.P1.Character)} [{frame.P1.Action}]";
                 p2State.Text = $"HP {frame.P2.Hp:N0} · 灵力 {frame.P2.Spirit:N0}\n" +
                     $"{ActionCatalog.Display(frame.P2.Action, frame.P2.Character)} [{frame.P2.Action}]";
-                p1Hand.Children.Clear(); p2Hand.Children.Clear();
-                foreach (var (panel, fighter) in new[] { (p1Hand, frame.P1), (p2Hand, frame.P2) })
+                foreach (var (panel, fighter, side) in new[] { (p1Hand, frame.P1, 0), (p2Hand, frame.P2, 1) })
                 {
+                    var handKey = fighter.Character + ":" + (fighter.HandIds is null ? "?" : string.Join(',', fighter.HandIds));
+                    if (renderedHands[side] == handKey) continue;
+                    renderedHands[side] = handKey;
+                    panel.Children.Clear();
                     if (fighter.HandIds is null || fighter.HandIds.Length == 0)
                     {
                         panel.Children.Add(Text("暂无抽牌", 10, palette["SidebarMuted"]));
@@ -1218,67 +1241,51 @@ public sealed partial class MainWindow : Window
     {
         if (replayPlaybackContent is null || replaySnapshotContent is null ||
             replayQuickContent is null || replayBookmarksContent is null) return;
-        var quick = new StackPanel();
-        if (session is not null)
-            foreach (var item in session.Events.Take(10))
-            {
-                var e = item;
-                var row = Button("", () => Jump(e.Ordinal));
-                row.Content = Vertical(Text($"{Time(e.Ordinal)} · {e.Kind}", 12, TextColor, true),
-                    Text(e.Detail, 10, Muted));
-                row.HorizontalContentAlignment = HorizontalAlignment.Left;
-                row.Margin = new Thickness(0, 0, 0, 6);
-                row.ToolTip = "定位到 " + Time(e.Ordinal);
-                quick.Children.Add(row);
-            }
-        if (quick.Children.Count == 0) quick.Children.Add(Text("载入含逐帧状态的轨迹后显示事件。", 12, Muted));
-        var quickScroll = new ScrollViewer { Content = quick, MaxHeight = 220,
-            VerticalScrollBarVisibility = ScrollBarVisibility.Hidden,
-            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
-        Expander Tool(string title, UIElement body, bool expanded = false) => new() {
-            Header = title, Content = new ScrollViewer { Content = body, MaxHeight = 270,
-                VerticalScrollBarVisibility = ScrollBarVisibility.Hidden,
-                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled },
-            IsExpanded = expanded, Margin = new Thickness(0, 0, 0, 7),
-            Foreground = TextColor, FontWeight = FontWeights.SemiBold };
-        var simulation = Vertical(
-            Tool("输入分支录制", BranchControls(), true),
-            Tool("压制缝提示", GapControls()));
-        var replaySpeeds = new WrapPanel { Margin = new Thickness(0, 6, 0, 10) };
-        var localSpeeds = new List<(double Rate, Button Control)>();
-        foreach (var rate in new[] { 0.5, 0.75, 1.0, 1.5, 2.0 })
-        {
-            var selectedRate = rate;
-            var control = Button($"{rate:0.##}×", () => {
-                playbackSpeed = selectedRate;
-                SaveSettings();
-                UpdateTransport();
-                foreach (var (itemRate, button) in localSpeeds)
-                {
-                    var active = Math.Abs(itemRate - selectedRate) < .001;
-                    button.Background = active ? Blue : Surface;
-                    button.Foreground = active ? palette["OnAccent"] : TextColor;
-                    button.BorderBrush = active ? Blue : Border;
-                }
-                SetGameSpeed(selectedRate);
-            }, Math.Abs(playbackSpeed - rate) < .001);
-            control.Padding = new Thickness(9, 5, 9, 5);
-            localSpeeds.Add((rate, control));
-            replaySpeeds.Children.Add(control);
-        }
+        // Keep every event available without constructing a button for every
+        // item on each refresh. Recycling only creates the visible rows.
+        var quick = new ListBox {
+            ItemsSource = session?.Events.Select(e => new {
+                e.Ordinal, Label = $"{Time(e.Ordinal)} · {e.Kind}\n{e.Detail}"
+            }).ToArray(),
+            Background = Brushes.Transparent,
+            BorderThickness = new Thickness(0), Foreground = TextColor
+        };
+        VirtualizingStackPanel.SetIsVirtualizing(quick, true);
+        VirtualizingStackPanel.SetVirtualizationMode(quick, VirtualizationMode.Recycling);
+        ScrollViewer.SetCanContentScroll(quick, true);
+        ScrollViewer.SetVerticalScrollBarVisibility(quick, ScrollBarVisibility.Auto);
+        ScrollViewer.SetHorizontalScrollBarVisibility(quick, ScrollBarVisibility.Disabled);
+        var row = new FrameworkElementFactory(typeof(Button));
+        row.SetBinding(FrameworkElement.TagProperty, new Binding("Ordinal"));
+        row.SetValue(Control.HorizontalContentAlignmentProperty, HorizontalAlignment.Left);
+        row.SetValue(Control.BackgroundProperty, Surface);
+        row.SetValue(Control.ForegroundProperty, TextColor);
+        row.SetValue(Control.BorderBrushProperty, Border);
+        row.SetValue(Control.PaddingProperty, new Thickness(9, 6, 9, 6));
+        row.AddHandler(System.Windows.Controls.Button.ClickEvent, new RoutedEventHandler((sender, _) => {
+            if (((Button)sender).Tag is int ordinal) Jump(ordinal);
+        }));
+        var label = new FrameworkElementFactory(typeof(TextBlock));
+        label.SetBinding(TextBlock.TextProperty, new Binding("Label"));
+        label.SetValue(TextBlock.TextWrappingProperty, TextWrapping.Wrap);
+        label.SetValue(TextBlock.FontSizeProperty, 12.0);
+        row.AppendChild(label);
+        quick.ItemTemplate = new DataTemplate { VisualTree = row };
+        var itemStyle = new Style(typeof(ListBoxItem));
+        itemStyle.Setters.Add(new Setter(Control.HorizontalContentAlignmentProperty, HorizontalAlignment.Stretch));
+        itemStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(0)));
+        itemStyle.Setters.Add(new Setter(FrameworkElement.MarginProperty, new Thickness(0, 0, 0, 6)));
+        quick.ItemContainerStyle = itemStyle;
         var replayCommands = new WrapPanel();
-        replayPlayButton = Button(probeStatus?.Status == 2 || playing ? "暂停" : "播放",
-            TogglePlayback, true);
-        replayCommands.Children.Add(replayPlayButton);
-        replayCommands.Children.Add(Button("－1 秒", () => SeekRelative(-ReplayTiming.FramesPerSecond)));
-        replayCommands.Children.Add(Button("＋1 秒", () => SeekRelative(ReplayTiming.FramesPerSecond)));
-        replayPlaybackContent.Content = Vertical(Text("播放速度", 12, Muted),
-            replaySpeeds, replayCommands, simulation);
+        if (branchOriginal is not null && !branchBusy)
+            replayCommands.Children.Add(Button("返回原回放", ReturnOriginalBranch));
+        replayPlaybackContent.Content = Vertical(replayCommands, GapControls());
         replaySnapshotContent.Content = new ScrollViewer {
-            Content = SnapshotControls(), MaxHeight = 210,
-            VerticalScrollBarVisibility = ScrollBarVisibility.Hidden,
+            Content = SnapshotControls(),
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
             HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
-        replayQuickContent.Content = quickScroll;
+        replayQuickContent.Content = quick.Items.Count > 0 ? quick :
+            Text("载入含逐帧状态的轨迹后显示事件。", 12, Muted);
         replayBookmarksContent.Content = BookmarkControls();
     }
     private sealed record ReplaySnapshot(int Ordinal, int Defender, string Kind, int GapLength);
@@ -1319,12 +1326,12 @@ public sealed partial class MainWindow : Window
         if (selected + 1 < points.Length)
             navigator.Children.Add(Button("下一处", () => Jump(points[selected + 1].Ordinal)));
         panel.Children.Add(navigator);
-        var nativeReady = probe is not null && probeStatus?.Status == 3 &&
+        var nativeReady = NativeSessionMatches && probe is not null && probeStatus?.Status == 3 &&
             session.Header is not null && branchOriginal is null &&
             nativeSnapshotPid == probe.Pid &&
             string.Equals(nativeSnapshotSource, session.Source,
                 StringComparison.OrdinalIgnoreCase);
-        if (probe is not null && probeStatus?.Status == 3 && session.Header is not null &&
+        if (NativeSessionMatches && probe is not null && probeStatus?.Status == 3 && session.Header is not null &&
             branchOriginal is null && nativeSnapshotSlots.Count == 0)
         {
             nativeSnapshotPid = probe.Pid;
@@ -1363,7 +1370,7 @@ public sealed partial class MainWindow : Window
 
     private async Task SaveNativeSnapshotAsync(int ordinal)
     {
-        if (probe is null || probeStatus?.Status != 3 || probeStatus.Ordinal != ordinal ||
+        if (PlaybackOperationBlocked || ReplayControlInFlight || !NativeSessionMatches || probe is null || probeStatus?.Status != 3 || probeStatus.Ordinal != ordinal ||
             session?.Header is null || branchOriginal is not null) return;
         if (nativeSnapshotSlots.Count >= 16 && !nativeSnapshotSlots.Contains(ordinal))
         {
@@ -1371,8 +1378,11 @@ public sealed partial class MainWindow : Window
             Render();
             return;
         }
+        nativeTransportBusy = true;
+        await playbackControlGate.WaitAsync();
         try
         {
+            if (PlaybackOperationBlocked) return;
             probeStatus = await probe.SendAsync(ProbeCommand.SaveSnapshot, target: ordinal);
             nativeSnapshotPid = probe.Pid;
             nativeSnapshotSource = session.Source;
@@ -1380,6 +1390,7 @@ public sealed partial class MainWindow : Window
             message = $"已保存第 {ordinal:N0} 帧的原生游戏状态。";
         }
         catch (Exception ex) { message = $"原生快照保存失败：{ex.Message}"; }
+        finally { nativeTransportBusy = false; playbackControlGate.Release(); UpdateTransport(); }
         Render();
     }
 
@@ -1392,9 +1403,8 @@ public sealed partial class MainWindow : Window
                 StringComparison.OrdinalIgnoreCase)) return;
         try
         {
-            probeStatus = await probe.SendAsync(ProbeCommand.RestoreSnapshot, target: ordinal);
-            await RefreshSessionFromProbe();
-            cursor = ordinal;
+            await SeekPlaybackAsync(ordinal);
+            if (probe.Read().Status != 3 || probe.Read().Ordinal != ordinal || cursor != ordinal) return;
             message = $"已直接恢复第 {ordinal:N0} 帧的游戏内存状态。";
         }
         catch (Exception ex)
@@ -1492,146 +1502,30 @@ public sealed partial class MainWindow : Window
         return panel;
     }
 
-    private UIElement BranchControls()
-    {
-        var panel = new StackPanel();
-        recorderStatusLabel = Text(recordingInput
-            ? $"正在录制 {recordingSide + 1}P：{recordedInput.Count}/512 帧。方向键移动，Z/X/C/V 为 A/B/C/D。"
-            : branchBusy ? "正在游戏引擎中计算分支…"
-            : branchOriginal is not null
-                ? $"当前显示 {branchOriginal.Header?.Player1} vs {branchOriginal.Header?.Player2} 的输入分支；可返回原回放第 {branchAnchor} 帧。"
-                : "游戏暂停并定位后，可在此录制 1P 或 2P 的输入并计算临时 REP 分支。",
-            12, Muted);
-        panel.Children.Add(recorderStatusLabel);
-        var buttons = new WrapPanel { Margin = new Thickness(0, 10, 0, 0) };
-        if (recordingInput) buttons.Children.Add(Button("结束并计算", StopAndRunBranch, true));
-        else if (!branchBusy && branchOriginal is null)
-        {
-            buttons.Children.Add(Button("录制 1P", () => StartInputRecording(0)));
-            buttons.Children.Add(Button("录制 2P", () => StartInputRecording(1)));
-        }
-        if (!branchBusy && branchOriginal is not null)
-            buttons.Children.Add(Button("返回原回放", ReturnOriginalBranch, true));
-        panel.Children.Add(buttons);
-        return panel;
-    }
-
-    private async void StartInputRecording(int side)
-    {
-        if (probe is null || session?.Header is null || session.Frames.Count == 0 ||
-            branchBusy || fullCaptureBusy || recordingInput || branchOriginal is not null)
-        {
-            message = "请先导入带轨迹的原 REP、连接游戏探针并载入该 REP。";
-            Render(); return;
-        }
-        try
-        {
-            var status = probe.Read();
-            if (status.Status == 2)
-                status = await probe.SendAsync(ProbeCommand.Pause);
-            if (status.Status != 3)
-                throw new InvalidOperationException("游戏回放尚未载入或无法暂停。");
-            if (cursor != status.Ordinal)
-                status = await probe.SendAsync(ProbeCommand.Seek, target: cursor);
-            probeStatus = status;
-            await RefreshSessionFromProbe();
-            if (session?.Header is null || status.Ordinal < 32)
-                throw new InvalidOperationException("接管帧之前需要至少 30 帧完整轨迹。");
-            recordingOriginal = session;
-            recordingAnchor = status.Ordinal;
-            recordingSide = side;
-            recordedInput.Clear();
-            recordingInput = true;
-            message = "录制中：保持焦点在复盘程序，方向键移动，Z/X/C/V 为 A/B/C/D；最长 512 帧。";
-            inputTimer.Start();
-        }
-        catch (Exception ex) { message = $"开始录制失败：{ex.Message}"; }
-        Render();
-        Focus();
-    }
-
-    private void CaptureInputFrame()
-    {
-        if (!recordingInput) return;
-        if (!IsActive)
-        {
-            inputTimer.Stop();
-            recordingInput = false;
-            recordedInput.Clear();
-            message = "窗口失去焦点，录制已取消；请在复盘程序内操作。";
-            Render();
-            return;
-        }
-        ushort mask = 0;
-        if (Keyboard.IsKeyDown(Key.Up)) mask |= 1;
-        if (Keyboard.IsKeyDown(Key.Down)) mask |= 2;
-        if (Keyboard.IsKeyDown(Key.Left)) mask |= 4;
-        if (Keyboard.IsKeyDown(Key.Right)) mask |= 8;
-        if (Keyboard.IsKeyDown(Key.Z)) mask |= 0x10;
-        if (Keyboard.IsKeyDown(Key.X)) mask |= 0x20;
-        if (Keyboard.IsKeyDown(Key.C)) mask |= 0x40;
-        if (Keyboard.IsKeyDown(Key.V)) mask |= 0x80;
-        recordedInput.Add(mask);
-        if (recorderStatusLabel is not null)
-            recorderStatusLabel.Text = $"正在录制 {recordingSide + 1}P：{recordedInput.Count}/512 帧。";
-        if (recordedInput.Count >= 512) StopAndRunBranch();
-    }
-
-    private static bool IsRecordKey(Key key) => key is Key.Up or Key.Down or Key.Left or Key.Right
-        or Key.Z or Key.X or Key.C or Key.V;
-
-    private async void StopAndRunBranch()
-    {
-        if (!recordingInput || probe is null || recordingOriginal is null) return;
-        inputTimer.Stop();
-        recordingInput = false;
-        if (recordedInput.All(mask => mask == 0))
-        {
-            message = "没有录到按键；请重新录制。";
-            Render(); return;
-        }
-        branchBusy = true;
-        ClearNativeSnapshots();
-        message = $"正在计算 {recordedInput.Count} 帧输入分支…";
-        Render();
-        try
-        {
-            var original = recordingOriginal;
-            var result = await ReplayBranchRunner.RunAsync(probe, original, root,
-                recordingAnchor, recordingSide, recordedInput.ToArray());
-            branchOriginal = original;
-            branchAnchor = recordingAnchor;
-            session = result.Session;
-            cursor = result.End;
-            probeStatus = probe.Read();
-            message = $"分支计算完成：{result.MatchedInputFrames}/{recordedInput.Count} 帧输入与引擎轨迹一致。";
-        }
-        catch (Exception ex) { message = $"分支计算失败：{ex.Message}"; }
-        finally
-        {
-            branchBusy = false;
-            recordingOriginal = null;
-            Render();
-        }
-    }
-
     private async void ReturnOriginalBranch()
     {
-        if (probe is null || branchOriginal is null || branchBusy) return;
+        if (PlaybackOperationBlocked || ReplayControlInFlight || probe is null || branchOriginal is null || branchBusy) return;
         branchBusy = true;
         ClearNativeSnapshots();
         Render();
+        await playbackControlGate.WaitAsync();
         try
         {
+            if (shutdownInProgress || shutdownReady) return;
+            nativeReplaySource = null;
+            nativePlaybackReleased = true;
             probeStatus = await ReplayBranchRunner.RestoreAsync(probe,
                 branchOriginal, root, branchAnchor);
             session = branchOriginal;
-            cursor = branchAnchor;
+            nativeReplaySource = session.Source;
+            nativePlaybackReleased = false;
+            probeStatus = await probe.SendAsync(ProbeCommand.Speed, (int)Math.Round(playbackSpeed * 100));
+            AdoptPlaybackPosition(probeStatus);
             branchOriginal = null;
             message = $"已返回原回放第 {cursor} 帧。";
         }
         catch (Exception ex) { message = $"返回原回放失败：{ex.Message}"; }
-        finally { branchBusy = false; Render(); }
+        finally { branchBusy = false; playbackControlGate.Release(); Render(); }
     }
     private void StatsPage()
     {
@@ -1758,40 +1652,56 @@ public sealed partial class MainWindow : Window
     }
     private async Task RemoveCurrentSampleAsync()
     {
-        if (session is null || sessionLoading || branchBusy || escapeBusy ||
-            fullCaptureBusy || recordingInput) return;
+        if (PlaybackOperationBlocked || ReplayControlInFlight || session is null || sessionLoading || branchBusy || escapeBusy ||
+            fullCaptureBusy) return;
         PausePlayback();
-        samples.RemoveAll(x => string.Equals(x.Source, session.Source,
-            StringComparison.OrdinalIgnoreCase));
-        var next = samples.LastOrDefault();
-        if (next is not null) { await Load(next.Source); return; }
+        var removedSource = (branchOriginal ?? session).Source;
+        bool IsRemoved(ReplaySession item) => string.Equals(System.IO.Path.GetFullPath(item.Source),
+            System.IO.Path.GetFullPath(removedSource), StringComparison.OrdinalIgnoreCase);
+        var next = samples.LastOrDefault(x => !IsRemoved(x));
+        if (next is not null)
+        {
+            // Keep the current sample until its replacement has actually loaded.
+            await Load(next.Source);
+            if (session is not null && string.Equals(System.IO.Path.GetFullPath(session.Source),
+                    System.IO.Path.GetFullPath(next.Source), StringComparison.OrdinalIgnoreCase))
+            { samples.RemoveAll(IsRemoved); Render(); }
+            return;
+        }
+        samples.RemoveAll(IsRemoved);
+        nativeTransportBusy = true;
+        await playbackControlGate.WaitAsync();
         session = null;
         cursor = 0;
-        ClearNativeSnapshots();
+        ResetReplayContext();
         try
         {
-            if (probe is not null && probeStatus?.Status is 2 or 3)
+            if (probe is not null && probe.Read().Status is 2 or 3)
                 probeStatus = await probe.SendAsync(ProbeCommand.Release);
             message = "已移除最后一份分析样本。";
         }
         catch (Exception ex) { message = $"样本已移除，但游戏回放未能释放：{ex.Message}"; }
+        finally { nativeTransportBusy = false; playbackControlGate.Release(); UpdateTransport(); }
         Render();
     }
     private async Task ClearAllSamplesAsync()
     {
-        if (sessionLoading || branchBusy || escapeBusy || fullCaptureBusy || recordingInput) return;
+        if (PlaybackOperationBlocked || ReplayControlInFlight || sessionLoading || branchBusy || escapeBusy || fullCaptureBusy) return;
         PausePlayback();
         samples.Clear();
+        nativeTransportBusy = true;
+        await playbackControlGate.WaitAsync();
         session = null;
         cursor = 0;
-        ClearNativeSnapshots();
+        ResetReplayContext();
         try
         {
-            if (probe is not null && probeStatus?.Status is 2 or 3)
+            if (probe is not null && probe.Read().Status is 2 or 3)
                 probeStatus = await probe.SendAsync(ProbeCommand.Release);
             message = "多局样本列表已清空。";
         }
         catch (Exception ex) { message = $"样本已清空，但游戏回放未能释放：{ex.Message}"; }
+        finally { nativeTransportBusy = false; playbackControlGate.Release(); UpdateTransport(); }
         Render();
     }
     private sealed record MultiMetric(string Category, string Name, string Unit, int Digits,
@@ -2075,15 +1985,18 @@ public sealed partial class MainWindow : Window
         foreach (var n in new[] {1,2,3})
         {
             var count = n;
-            selector.Children.Add(Button($"至少 {n} 招", () => {
+            var threshold = Button($"至少 {n} 招", () => {
+                if (escapeBusy) return;
                 if (minPressureMoves != count) escapeResults.Clear();
                 minPressureMoves = count;
                 SaveSettings();
                 Render();
-            }, n == minPressureMoves));
+            }, n == minPressureMoves);
+            threshold.IsEnabled = !escapeBusy;
+            selector.Children.Add(threshold);
         }
         content.Children.Add(Card("最少连续招式", selector));
-        var selected = session.Pressures.Where(x => x.ConfirmedMoves >= minPressureMoves).ToArray();
+        var selected = PressureSelection.Select(session, minPressureMoves);
         UIElement PressureOverview(int side)
         {
             var own = selected.Where(x => x.Attacker == side).ToArray();
@@ -2179,850 +2092,6 @@ public sealed partial class MainWindow : Window
         }
         content.Children.Add(Columns((SidePressures(0), 1), (SidePressures(1), 1)));
     }
-    private void EscapePage()
-    {
-        if (session?.Frames.Count == 0 || session is null) { Empty("需要真实游戏的逐帧轨迹才能选择防御空隙。"); return; }
-        var escapeSource = branchOriginal ?? session;
-        var controls = new WrapPanel();
-        foreach (var (caption, side) in new[] { ("双方", -1), ("1P 防守", 0), ("2P 防守", 1) })
-        {
-            var selected = side;
-            controls.Children.Add(Button(caption, () => { escapeDefender = selected; SaveSettings(); Render(); },
-                escapeDefender == side));
-        }
-        controls.Children.Add(Button("全部结果", () => {
-            escapeOnlySuccess = false; SaveSettings(); Render(); }, !escapeOnlySuccess));
-        controls.Children.Add(Button("仅成功", () => {
-            escapeOnlySuccess = true; SaveSettings(); Render(); }, escapeOnlySuccess));
-        controls.Children.Add(Text("    尝试输入：", 12, Muted));
-        var characters = escapeDefender switch {
-            0 => new[] { session.Header?.Character1 ?? session.Frames[0].P1.Character },
-            1 => new[] { session.Header?.Character2 ?? session.Frames[0].P2.Character },
-            _ => new[] { session.Header?.Character1 ?? session.Frames[0].P1.Character,
-                session.Header?.Character2 ?? session.Frames[0].P2.Character }
-        };
-        var availableMoves = characters.SelectMany(EscapeTrial.AvailableMoves)
-            .Concat(addedEscapeMoves).Distinct().ToArray();
-        if (!availableMoves.Contains(escapeMove)) escapeMove = availableMoves[0];
-        var movePicker = new ComboBox { Width = 95, Margin = new Thickness(6, 0, 12, 0),
-            ItemsSource = availableMoves, SelectedItem = escapeMove };
-        movePicker.SelectionChanged += (_, _) => {
-            escapeMove = movePicker.SelectedItem as string ?? "4A";
-            SaveSettings();
-            Render();
-        };
-        controls.Children.Add(movePicker);
-        var extraMove = new TextBox { Width = 85, Margin = new Thickness(4, 0, 4, 0),
-            VerticalContentAlignment = VerticalAlignment.Center,
-            ToolTip = "如 236B、214C、J236B" };
-        controls.Children.Add(extraMove);
-        controls.Children.Add(Button("添加招式", () => {
-            var entered = extraMove.Text.Trim().ToUpperInvariant();
-            if (!characters.Any(character => EscapeTrial.IsAvailable(character, entered)))
-                message = "该角色没有这个输入指令；例如可添加 236B 或 214C。";
-            else {
-                addedEscapeMoves.Add(entered);
-                enabledEscapeMoves.Add(entered);
-                escapeMove = entered;
-                SaveSettings();
-                message = $"已添加并启用 {entered}。";
-            }
-            Render();
-        }));
-        var moveToggles = new UniformGrid { Columns = 6, Margin = new Thickness(0, 9, 0, 0) };
-        controls.Children.Add(Button("全选可用招式", () => {
-            foreach (var move in availableMoves) enabledEscapeMoves.Add(move);
-            SaveSettings(); Render();
-        }));
-        controls.Children.Add(Button("清空批量选择", () => {
-            enabledEscapeMoves.Clear(); SaveSettings(); Render();
-        }));
-        foreach (var move in availableMoves)
-        {
-            var selected = move;
-            var toggle = Button(move, () => {
-                if (!enabledEscapeMoves.Add(selected)) enabledEscapeMoves.Remove(selected);
-                escapeMove = selected;
-                SaveSettings(); Render();
-            }, enabledEscapeMoves.Contains(move));
-            toggle.Margin = new Thickness(2);
-            toggle.MinHeight = 36;
-            toggle.ToolTip = "点击切换批量推演选择；单处计算使用当前招式";
-            moveToggles.Children.Add(toggle);
-        }
-        if (branchOriginal is not null)
-            controls.Children.Add(Button("返回原回放", ReturnOriginalBranch, true));
-        escapeProgressLabel = Text(escapeBusy && escapeBatchTotal > 0
-            ? $"已完成 {escapeBatchDone}/{escapeBatchTotal} 处；取消会在当前试验结束后生效。"
-            : escapeBusy ? "游戏正在计算该接触点的输入分支…"
-            : "选择下方空隙后可单次推演，也可批量计算当前筛选的全部空隙。",
-            12, Muted);
-        content.Children.Add(Card("逃压推演设置", Vertical(controls,
-            Text("勾选招式后可批量计算；上方下拉框用于单处推演。", 12, Muted),
-            moveToggles, escapeProgressLabel)));
-        var eligible = EscapeTrial.EligibleGaps(escapeSource, escapeDefender,
-            escapeMove, minPressureMoves).ToArray();
-        if (escapeBusy && escapeBatchTotal > 0)
-            controls.Children.Add(Button("当前试验后取消", () => {
-                escapeBatchCancelRequested = true;
-                if (escapeProgressLabel is not null)
-                    escapeProgressLabel.Text = "取消已请求；当前试验结束后返回原回放。";
-            }));
-        else if (!escapeBusy)
-        {
-            var jobs = availableMoves.Where(enabledEscapeMoves.Contains)
-                .SelectMany(move => EscapeTrial.EligibleGaps(escapeSource, escapeDefender,
-                    move, minPressureMoves).Select(gap => (Gap: gap, Move: move)))
-                .DistinctBy(job => (EscapeTrial.Anchor(job.Gap, job.Move), job.Gap.Defender, job.Move))
-                .Where(job => !HasEscapeResult(escapeSource, job.Gap, job.Move))
-                .OrderBy(job => EscapeTrial.Anchor(job.Gap, job.Move)).ToArray();
-            if (jobs.Length > 0)
-                controls.Children.Add(Button($"批量推演 {jobs.Length} 项", async () =>
-                    await RunEscapeBatchAsync(jobs), true));
-        }
-        var results = escapeResults.AsEnumerable().Reverse()
-            .Where(x => x.Original.Header?.Hash == escapeSource.Header?.Hash)
-            .Where(x => !escapeOnlySuccess || x.Verdict.Result == "成功").ToArray();
-        if (!results.Contains(selectedEscapeResult)) selectedEscapeResult = results.FirstOrDefault();
-        string[] ResultRow(EscapeTrialResult result)
-        {
-            var pressure = result.Original.Pressures.LastOrDefault(x =>
-                x.Defender == result.Defender && x.Start <= result.Anchor &&
-                result.Anchor <= x.End);
-            var gap = result.Original.PressureGaps.FirstOrDefault(x =>
-                x.Defender == result.Defender &&
-                EscapeTrial.Anchor(x, result.Move) == result.Anchor);
-            return [Time(result.Anchor), pressure is null ? "—" : Time(pressure.Start),
-                gap is null ? "—" : Time(gap.NextContact), result.Move,
-                result.Verdict.Result,
-                result.Verdict.Reason + $" · 输入验证 {result.MatchedInputFrames}/90"];
-        }
-        var resultRows = results.Select(ResultRow).ToList();
-        if (resultRows.Count == 0)
-            resultRows.Add(["", "", "", "", "", "尚无实机推演结果"]);
-        var resultTable = Table(["时间", "压制段", "接触点", "尝试", "结果", "依据"],
-            resultRows);
-        BindTimeline(resultTable, new Dictionary<string, IReadOnlyList<int>> {
-            ["时间"] = results.Select(x => x.Anchor).ToArray(),
-            ["压制段"] = results.Select(result => result.Original.Pressures
-                .LastOrDefault(x => x.Defender == result.Defender &&
-                    x.Start <= result.Anchor && result.Anchor <= x.End)?.Start ?? -1).ToArray(),
-            ["接触点"] = results.Select(result => result.Original.PressureGaps
-                .FirstOrDefault(x => x.Defender == result.Defender &&
-                    EscapeTrial.Anchor(x, result.Move) == result.Anchor)?
-                .NextContact ?? -1).ToArray()
-        }, Jump, (index, ordinal) => _ = OpenEscapeResultAsync(results[index], ordinal));
-        var resultActions = new WrapPanel();
-        if (results.Length > 0)
-        {
-            var resultPicker = new ComboBox { Width = 300,
-                Margin = new Thickness(0, 0, 8, 8),
-                ItemsSource = results.Select(x =>
-                    $"{Time(x.Anchor)} · {x.Move} · {x.Verdict.Result}").ToArray(),
-                SelectedIndex = Math.Max(0, Array.IndexOf(results, selectedEscapeResult)) };
-            resultPicker.SelectionChanged += (_, _) => {
-                if (resultPicker.SelectedIndex is >= 0 && resultPicker.SelectedIndex < results.Length)
-                    selectedEscapeResult = results[resultPicker.SelectedIndex];
-            };
-            resultActions.Children.Add(resultPicker);
-            resultActions.Children.Add(Button("载入所选分支", () => {
-                if (resultPicker.SelectedIndex is >= 0 && resultPicker.SelectedIndex < results.Length)
-                    _ = OpenEscapeResultAsync(results[resultPicker.SelectedIndex]);
-            }));
-        }
-        content.Children.Add(Card("实机推演结果", Vertical(resultActions, resultTable)));
-        var table = Table(["空隙起点", "下次接触", "防守方", "空隙帧", "4A 帧数", "来源"],
-            eligible.Select(gap => new[] { Time(gap.Start), Time(gap.NextContact),
-                gap.Defender == 0 ? "1P" : "2P", gap.Length.ToString(),
-                PressureGapDetector.FourAStartup(
-                    escapeSource.Frames[gap.Start].Side(gap.Defender).Character).ToString(), gap.Source }));
-        BindTimeline(table, new Dictionary<string, IReadOnlyList<int>> {
-            ["空隙起点"] = eligible.Select(x => x.Start).ToArray(),
-            ["下次接触"] = eligible.Select(x => x.NextContact).ToArray()
-        }, Jump, (index, ordinal) => OpenEscapeGap(eligible[index], ordinal));
-        var gapActions = new WrapPanel();
-        if (eligible.Length > 0)
-        {
-            var gapPicker = new ComboBox { Width = 300,
-                Margin = new Thickness(0, 0, 8, 8),
-                ItemsSource = eligible.Select(x =>
-                    $"{Time(x.Start)} · {x.Defender + 1}P · {x.Length} 帧").ToArray(),
-                SelectedIndex = 0 };
-            gapActions.Children.Add(gapPicker);
-            gapActions.Children.Add(Button("计算所选空隙", () => {
-                if (gapPicker.SelectedIndex is >= 0 && gapPicker.SelectedIndex < eligible.Length)
-                    RunEscapeTrial(eligible[gapPicker.SelectedIndex]);
-            }, true));
-        }
-        content.Children.Add(Card($"可尝试的防御空隙 · {eligible.Length} 处",
-            Vertical(gapActions, table)));
-    }
-
-    private async void RunEscapeTrial(PressureGap gap)
-    {
-        if (escapeBusy || branchBusy || fullCaptureBusy || recordingInput) return;
-        if (branchOriginal is not null)
-        {
-            message = "请先返回原回放，再计算下一项逃压输入。";
-            Render(); return;
-        }
-        if (probe is null || session?.Header is null ||
-            !string.Equals(System.IO.Path.GetExtension(session.Source), ".rep",
-                StringComparison.OrdinalIgnoreCase))
-        {
-            message = "请先连接游戏探针并导入原 REP。";
-            Render(); return;
-        }
-        var originalSession = session;
-        var activeProbe = probe;
-        var move = escapeMove;
-        var anchor = EscapeTrial.Anchor(gap, move);
-        var existing = FindEscapeResult(originalSession, gap, move);
-        if (existing is not null && HasEscapeResult(originalSession, gap, move))
-        {
-            await OpenEscapeResultAsync(existing);
-            return;
-        }
-        PausePlayback();
-        escapeBusy = true;
-        escapeBatchCancelRequested = false;
-        ClearNativeSnapshots();
-        message = $"正在对 {Time(gap.Start)} 的防御空隙尝试 {move}…";
-        Render();
-        try
-        {
-            var (branch, verdict) = await ComputeEscapeAsync(activeProbe,
-                originalSession, gap, move);
-            StoreEscapeResult(new(anchor, gap.Defender, move, verdict,
-                originalSession, branch.ReplayPath, branch.End, branch.MatchedInputFrames));
-            branchOriginal = originalSession;
-            branchAnchor = anchor;
-            var branchHash = branch.Session.Header?.Hash ??
-                throw new InvalidDataException("推演分支缺少 REP 文件头。");
-            session = await Task.Run(() => ReplayAnalyzer.Analyze(branch.ReplayPath,
-                branch.Session.Header, branch.Session.Frames, "当前实机推演分支"));
-            cursor = anchor;
-            // Fast simulation keeps the original REP loaded in the engine.
-            // Review must explicitly load the generated skill branch.
-            if (branch.Engine == "帧状态分支")
-                await activeProbe.SendAsync(ProbeCommand.Load, replayPath: branch.ReplayPath,
-                    tracePath: System.IO.Path.Combine(root, "trace_" + branchHash + ".csv"));
-            probeStatus = await activeProbe.SendAsync(ProbeCommand.Seek, target: anchor);
-            page = 0;
-            message = $"{move}：{verdict.Result}。{verdict.Reason}";
-        }
-        catch (Exception ex)
-        {
-            try
-            {
-                probeStatus = await ReplayBranchRunner.RestoreAsync(activeProbe,
-                    originalSession, root, anchor);
-                session = originalSession;
-                cursor = anchor;
-                branchOriginal = null;
-                message = $"逃压推演失败，已返回原回放：{ex.Message}";
-            }
-            catch (Exception recovery)
-            {
-                message = $"逃压推演失败，返回原回放也失败：{ex.Message}；{recovery.Message}";
-            }
-        }
-        finally { escapeBusy = false; Render(); }
-    }
-    private async Task<(ReplayBranchResult Branch, EscapeVerdict Verdict)> ComputeEscapeAsync(
-        ProbeClient activeProbe, ReplaySession original, PressureGap gap, string move,
-        ReplaySession? validatedBaseline = null,
-        Dictionary<string, ReplayBranchResult>? probeCache = null,
-        Dictionary<ProbeClient, InPlaceBranchRunner>? fastEngines = null)
-    {
-        if (original.Header is null || !File.Exists(original.Source))
-            throw new InvalidOperationException("原 REP 不存在。");
-        fastEngines ??= new Dictionary<ProbeClient, InPlaceBranchRunner>();
-        var anchor = EscapeTrial.Anchor(gap, move);
-        ReplaySession baseline;
-        if (validatedBaseline is null)
-        {
-            var cached = ValidatedEscapeBaseline(activeProbe, original, anchor + 90) ??
-                (HasCompleteEngineTrace(original, anchor + 90) ? original : null);
-            if (cached is not null && MatchesGap(cached, gap)) baseline = cached;
-            else
-            {
-                try
-                {
-                    var engine = await InPlaceBranchRunner.StartAsync(activeProbe, original, root);
-                    baseline = await engine.CaptureBaselineAsync(anchor + 90);
-                    fastEngines[activeProbe] = engine;
-                }
-                catch (Exception ex) when (ex is IOException or InvalidOperationException)
-                {
-                    fastEngines.Remove(activeProbe);
-                    var trace = System.IO.Path.Combine(root, "trace_" + original.Header.Hash + ".csv");
-                    await activeProbe.SendAsync(ProbeCommand.Load, replayPath: original.Source, tracePath: trace);
-                    await activeProbe.SendAsync(ProbeCommand.Seek, target: anchor + 90);
-                    baseline = await Task.Run(() => SessionLoader.LoadSimulationTrace(
-                        original.Source, original.Header, trace, detectGaps: true));
-                }
-                if (!MatchesGap(baseline, gap))
-                    throw new InvalidDataException(
-                        "当前游戏重算后未复现选中的压制空隙；请刷新整场实机轨迹后再推演。");
-                RememberEscapeBaseline(activeProbe, baseline);
-            }
-        }
-        else baseline = validatedBaseline;
-        var simulationTrace = validatedBaseline is not null;
-        var masks = EscapeTrial.Plan(baseline.Frames, gap, move);
-        probeCache ??= new Dictionary<string, ReplayBranchResult>();
-        var fastUnavailable = false;
-        async Task<ReplayBranchResult> RunInputsAsync(ushort[] inputs)
-        {
-            var key = $"{anchor}:{gap.Defender}:{string.Join(',', inputs)}";
-            if (probeCache.TryGetValue(key, out var saved)) return saved;
-            ReplayBranchResult computed;
-            try
-            {
-                if (fastUnavailable) throw new InvalidOperationException("本项快速推演已回退。");
-                if (!fastEngines.TryGetValue(activeProbe, out var engine))
-                {
-                    engine = await InPlaceBranchRunner.StartAsync(activeProbe, baseline, root);
-                    fastEngines[activeProbe] = engine;
-                }
-                computed = await engine.RunAsync(anchor, gap.Defender, inputs);
-            }
-            catch (Exception ex) when (ex is IOException or InvalidOperationException)
-            {
-                fastUnavailable = true;
-                fastEngines.Remove(activeProbe);
-                await ReplayBranchRunner.RestoreAsync(activeProbe, baseline, root, anchor);
-                computed = await ReplayBranchRunner.RunAsync(activeProbe, baseline,
-                    root, anchor, gap.Defender, inputs, analyzeForDisplay: false,
-                    requirePausedAtAnchor: false, simulationTrace: simulationTrace);
-            }
-            if (computed.MatchedInputFrames == inputs.Length) probeCache[key] = computed;
-            return computed;
-        }
-        EscapeVerdict InputMismatch(ReplayBranchResult result) => new("未判定",
-            $"引擎仅观察到 {result.MatchedInputFrames}/{masks.Length} 帧预期输入");
-        if (EscapeTrial.IsDashFollowup(move))
-        {
-            var dashOnly = EscapeTrial.Plan(baseline.Frames, gap, move,
-                dashDelay: -1);
-            var probeBranch = await RunInputsAsync(dashOnly);
-            if (probeBranch.MatchedInputFrames != dashOnly.Length)
-                return (probeBranch, InputMismatch(probeBranch));
-            var candidates = EscapeTrial.SafeDashReleaseOffsets(
-                probeBranch.Session.Frames, anchor, gap.Defender, masks.Length);
-            // Each timing reloads the game. Bound the existing search to four
-            // spread timings, and report an inconclusive search if none succeeds.
-            var sampled = candidates.Count <= 4 ? candidates.ToArray() :
-                new[] { candidates[0], candidates[candidates.Count / 3],
-                    candidates[2 * candidates.Count / 3], candidates[^1] }.Distinct().ToArray();
-            var lastBranch = probeBranch;
-            foreach (var delay in sampled)
-            {
-                if (escapeBatchCancelRequested) break;
-                masks = EscapeTrial.Plan(baseline.Frames, gap, move,
-                    dashDelay: delay);
-                var attempted = await RunInputsAsync(masks);
-                lastBranch = attempted;
-                if (attempted.MatchedInputFrames != masks.Length ||
-                    EscapeTrial.HitImmediatelyAfterRelease(attempted.Session.Frames,
-                        anchor, gap.Defender, delay)) continue;
-                var attemptVerdict = EscapeTrial.Judge(baseline.Frames,
-                    attempted.Session.Frames, anchor, gap.Defender, move, masks.Length);
-                if (attemptVerdict.Result == "成功")
-                    return (attempted, attemptVerdict with {
-                        Reason = $"冲刺 {delay} 帧后接招；{attemptVerdict.Reason}" });
-            }
-            return (lastBranch, new EscapeVerdict("未判定",
-                $"有限时机搜索未确认成功（候选 {candidates.Count} 个，最多试验 {sampled.Length} 个）；不能认定所有时机均失败"));
-        }
-        if (move.StartsWith("铜钱 ", StringComparison.Ordinal))
-        {
-            var preliminary = await RunInputsAsync(masks);
-            if (preliminary.MatchedInputFrames != masks.Length)
-                return (preliminary, InputMismatch(preliminary));
-            if (!preliminary.Session.CardEvents.Any(card =>
-                card.Side == gap.Defender && card.CardId == 12 &&
-                card.Kind == CardKind.Use && card.Ordinal > anchor &&
-                card.Ordinal <= anchor + masks.Length))
-                return (preliminary, new EscapeVerdict(
-                    preliminary.Session.Frames[preliminary.End].MatchState != 2 ||
-                    preliminary.Session.Frames[preliminary.End].Round != baseline.Frames[anchor].Round
-                        ? "未判定" : "失败",
-                    CardStartupObserved(baseline.Frames, preliminary.Session.Frames,
-                        anchor, gap.Defender, masks.Length)
-                        ? "铜钱动作已开始，但未完成用卡（可能被打断）"
-                        : "铜钱输入已送达游戏，当前状态下未触发卡牌动作"));
-            var cardPrefix = EscapeTrial.CardPrefixLength(
-                baseline.Frames[anchor].Side(gap.Defender), spell: false);
-            var followup = EscapeTrial.CoinFollowupOffset(preliminary.Session.Frames,
-                anchor, gap.Defender, cardPrefix, masks.Length);
-            if (followup is null)
-                return (preliminary, new EscapeVerdict("未判定", "观察窗口内未确认铜钱后的可行动帧"));
-            masks = EscapeTrial.Plan(baseline.Frames, gap, move,
-                coinFollowupStart: followup.Value);
-        }
-        var branch = await RunInputsAsync(masks);
-        var verdict = branch.MatchedInputFrames == masks.Length
-            ? EscapeTrial.Judge(baseline.Frames, branch.Session.Frames,
-                anchor, gap.Defender, move, masks.Length)
-            : new EscapeVerdict("未判定",
-                $"引擎仅观察到 {branch.MatchedInputFrames}/{masks.Length} 帧预期输入");
-        if (move is "SC" or "CARD" && branch.MatchedInputFrames == masks.Length &&
-            !branch.Session.CardEvents.Any(card => card.Side == gap.Defender &&
-                card.CardId is >= 200 and < 300 && card.Kind == CardKind.Use &&
-                card.Ordinal > anchor && card.Ordinal <= anchor + masks.Length))
-            verdict = new EscapeVerdict(
-                branch.Session.Frames[branch.End].MatchState != 2 ||
-                branch.Session.Frames[branch.End].Round != baseline.Frames[anchor].Round
-                    ? "未判定" : "失败",
-                (CardStartupObserved(baseline.Frames, branch.Session.Frames,
-                    anchor, gap.Defender, masks.Length)
-                    ? "符卡动作已开始，但未完成用卡"
-                    : "符卡输入未触发动作") + $"；{verdict.Reason}");
-        return (branch, verdict);
-    }
-
-    private static bool CardStartupObserved(IReadOnlyList<Frame> baseline,
-        IReadOnlyList<Frame> branch, int anchor, int side, int horizon)
-    {
-        var end = Math.Min(anchor + horizon, Math.Min(baseline.Count, branch.Count) - 1);
-        for (var i = anchor + 1; i <= end; i++)
-        {
-            var action = branch[i].Side(side).Action;
-            if (action is >= 600 and < 620 && action != baseline[i].Side(side).Action)
-                return true;
-        }
-        return false;
-    }
-
-    private static bool MatchesGap(ReplaySession baseline, PressureGap gap) =>
-        baseline.PressureGaps.Any(current => current.Defender == gap.Defender &&
-            current.Start == gap.Start && current.NextContact == gap.NextContact);
-
-    private ReplaySession? ValidatedEscapeBaseline(ProbeClient activeProbe,
-        ReplaySession original, int requiredFrame)
-    {
-        if (original.Header is null ||
-            !ReferenceEquals(cachedEscapeProbe, activeProbe) ||
-            cachedEscapeHash != original.Header.Hash ||
-            cachedEscapeBaseline is null ||
-            cachedEscapeBaseline.Frames.Count <= requiredFrame) return null;
-        return cachedEscapeBaseline;
-    }
-
-    private static bool HasCompleteEngineTrace(ReplaySession candidate,
-        int requiredFrame) => candidate.Header is not null &&
-        candidate.Frames.Count > requiredFrame &&
-        candidate.Frames[^1].MatchState == 5 &&
-        candidate.TraceOrigin is "已验证的完整实机轨迹" or "本机完整实机轨迹";
-
-    private void RememberEscapeBaseline(ProbeClient activeProbe, ReplaySession baseline)
-    {
-        if (!ReferenceEquals(cachedEscapeProbe, activeProbe) ||
-            cachedEscapeHash != baseline.Header?.Hash)
-            cachedEscapeTrials.Clear();
-        cachedEscapeProbe = activeProbe;
-        cachedEscapeHash = baseline.Header?.Hash;
-        cachedEscapeBaseline = baseline;
-    }
-
-    private EscapeTrialResult? FindEscapeResult(ReplaySession original, PressureGap gap, string move) =>
-        escapeResults.LastOrDefault(result => result.Original.Header?.Hash == original.Header?.Hash &&
-            result.Anchor == EscapeTrial.Anchor(gap, move) && result.Defender == gap.Defender &&
-            result.Move == move);
-
-    private bool HasEscapeResult(ReplaySession original, PressureGap gap, string move) =>
-        FindEscapeResult(original, gap, move) is { MatchedInputFrames: 90 } result &&
-        File.Exists(result.ReplayPath);
-
-    private void StoreEscapeResult(EscapeTrialResult result)
-    {
-        escapeResults.RemoveAll(previous => previous.Original.Header?.Hash == result.Original.Header?.Hash &&
-            previous.Anchor == result.Anchor && previous.Defender == result.Defender &&
-            previous.Move == result.Move);
-        escapeResults.Add(result);
-        selectedEscapeResult = result;
-    }
-
-    private void OpenEscapeGap(PressureGap gap, int ordinal)
-    {
-        var original = branchOriginal ?? session;
-        var result = original is null ? null : FindEscapeResult(original, gap, escapeMove);
-        if (result is null || !File.Exists(result.ReplayPath))
-        {
-            message = "该空隙的当前招式尚无推演分支，请先计算。";
-            Render();
-            return;
-        }
-        _ = OpenEscapeResultAsync(result, ordinal);
-    }
-
-    private bool TryCachedEscapeTrial(ProbeClient activeProbe, ReplaySession original,
-        PressureGap gap, string move, out EscapeTrialResult result)
-    {
-        var key = (gap.Start, gap.NextContact, gap.Defender, move);
-        if (original.Header is not null &&
-            ReferenceEquals(cachedEscapeProbe, activeProbe) &&
-            cachedEscapeHash == original.Header.Hash &&
-            cachedEscapeTrials.TryGetValue(key, out var cached) &&
-            CanReuseEscapeTrial(cached) &&
-            File.Exists(cached.ReplayPath))
-        {
-            result = cached with { Original = original };
-            return true;
-        }
-        result = null!;
-        return false;
-    }
-
-    private bool CanReuseEscapeTrial(EscapeTrialResult result) =>
-        !escapeBatchCancelRequested && result.MatchedInputFrames == 90 &&
-        (result.Verdict.Result != "未判定" || result.Verdict.Reason.StartsWith(
-            "有限时机搜索未确认成功", StringComparison.Ordinal));
-
-    private async Task RunEscapeBatchAsync((PressureGap Gap, string Move)[] jobs)
-    {
-        if (escapeBusy || branchBusy || fullCaptureBusy || recordingInput || jobs.Length == 0) return;
-        if (branchOriginal is not null)
-        {
-            message = "请先返回原回放，再开始批量推演。";
-            Render(); return;
-        }
-        if (probe is null || session?.Header is null ||
-            !string.Equals(System.IO.Path.GetExtension(session.Source), ".rep",
-                StringComparison.OrdinalIgnoreCase))
-        {
-            message = "批量推演需要连接游戏探针并导入原 REP。";
-            Render(); return;
-        }
-        var activeProbe = probe;
-        var original = session;
-        jobs = jobs.DistinctBy(job => (EscapeTrial.Anchor(job.Gap, job.Move),
-            job.Gap.Defender, job.Move)).Where(job => !HasEscapeResult(original, job.Gap, job.Move))
-            .OrderBy(job => EscapeTrial.Anchor(job.Gap, job.Move)).ThenBy(job => job.Gap.Defender).ToArray();
-        if (jobs.Length == 0)
-        {
-            escapeBatchDone = escapeBatchTotal = 0;
-            message = "所选空隙与招式已有结果，没有新的推演条目。";
-            Render();
-            return;
-        }
-        var returnCursor = Math.Clamp(cursor, 0, Math.Max(0, original.Frames.Count - 1));
-        var executionErrors = 0;
-        string? stopReason = null;
-        var timer = System.Diagnostics.Stopwatch.StartNew();
-        long baselineMilliseconds = 0;
-        long trialMilliseconds = 0;
-        long restoreMilliseconds = 0;
-        var engineTouched = false;
-        var parallelTrials = 0;
-        string? workerError = null;
-        var batchResults = new List<(int Index, EscapeTrialResult Result)>();
-        var mainFastEngines = new Dictionary<ProbeClient, InPlaceBranchRunner>();
-        var workerFastEngines = new Dictionary<ProbeClient, InPlaceBranchRunner>();
-        escapeBusy = true;
-        escapeBatchCancelRequested = false;
-        escapeBatchDone = 0;
-        escapeBatchTotal = jobs.Length;
-        ClearNativeSnapshots();
-        message = $"正在批量推演 {jobs.Length} 项新的防御空隙与输入。";
-        Render();
-        try
-        {
-            var pending = jobs.Where(job => !TryCachedEscapeTrial(activeProbe, original,
-                job.Gap, job.Move, out _)).ToArray();
-            var independentContacts = pending.Select(job => (job.Gap.Start,
-                job.Gap.NextContact, job.Gap.Defender)).Distinct().Count();
-            // Fresh branches are now ~0.1 s; starting another game costs seconds.
-            // Keep small/medium batches on the already initialized engine.
-            if (pending.Length >= 128 && independentContacts >= 2 &&
-                !SmokeDisableEscapeWorker &&
-                escapeWorker is null && pendingEscapeWorker is null)
-            {
-                var connectedGame = detectedGame?.Pid == activeProbe.Pid ? detectedGame :
-                    (await Task.Run(() => GameDiscovery.FindProcesses()))
-                        .FirstOrDefault(game => game.Pid == activeProbe.Pid);
-                if (connectedGame is not null)
-                    pendingEscapeWorker = EscapeWorkerGame.StartAsync(connectedGame.Exe, root);
-            }
-            ReplaySession? baseline = null;
-            if (pending.Length > 0)
-            {
-                var requiredFrame = pending.Max(job => EscapeTrial.Anchor(job.Gap, job.Move) + 90);
-                baseline = ValidatedEscapeBaseline(activeProbe, original, requiredFrame) ??
-                    (HasCompleteEngineTrace(original, requiredFrame) ? original : null);
-                if (baseline is null || pending.Any(job => !MatchesGap(baseline, job.Gap)))
-                {
-                    engineTouched = true;
-                    try
-                    {
-                        var engine = await InPlaceBranchRunner.StartAsync(activeProbe, original, root);
-                        baseline = await engine.CaptureBaselineAsync(requiredFrame);
-                        mainFastEngines[activeProbe] = engine;
-                    }
-                    catch (Exception ex) when (ex is IOException or InvalidOperationException)
-                    {
-                        mainFastEngines.Remove(activeProbe);
-                        var baselineTrace = System.IO.Path.Combine(root, "trace_" + original.Header.Hash + ".csv");
-                        await activeProbe.SendAsync(ProbeCommand.Load, replayPath: original.Source, tracePath: baselineTrace);
-                        await activeProbe.SendAsync(ProbeCommand.Seek, target: requiredFrame);
-                        baseline = await Task.Run(() => SessionLoader.LoadSimulationTrace(
-                            original.Source, original.Header, baselineTrace, detectGaps: true));
-                    }
-                }
-                var missing = pending.FirstOrDefault(job => !MatchesGap(baseline, job.Gap));
-                if (missing.Gap is not null)
-                    throw new InvalidDataException(
-                        $"当前游戏未复现 {Time(missing.Gap.Start)} 的压制空隙；请刷新实机轨迹。");
-                if (!ReferenceEquals(baseline, original))
-                    RememberEscapeBaseline(activeProbe, baseline);
-            }
-            baselineMilliseconds = timer.ElapsedMilliseconds;
-            if (pendingEscapeWorker is not null)
-            {
-                try { escapeWorker = await pendingEscapeWorker; }
-                catch (Exception ex) { workerError = ex.Message; }
-                finally { pendingEscapeWorker = null; }
-            }
-            if (escapeWorker is not null)
-            {
-                try
-                {
-                    if (!escapeWorker.IsAlive)
-                        throw new InvalidOperationException("并行游戏进程已经退出。");
-                    _ = escapeWorker.Probe.Read();
-                }
-                catch (Exception ex)
-                {
-                    workerError = ex.Message;
-                    await escapeWorker.DisposeAsync();
-                    escapeWorker = null;
-                }
-            }
-            var workerIndexes = new HashSet<int>();
-            var workerFailed = false;
-            var mainProbeCache = new Dictionary<string, ReplayBranchResult>();
-            var workerProbeCache = new Dictionary<string, ReplayBranchResult>();
-            if (escapeWorker is not null && pending.Length >= 128 &&
-                independentContacts >= 2 &&
-                !SmokeDisableEscapeWorker)
-            {
-                var fresh = Enumerable.Range(0, jobs.Length).Where(index =>
-                    !TryCachedEscapeTrial(activeProbe, original, jobs[index].Gap,
-                        jobs[index].Move, out _)).ToArray();
-                var groups = fresh.GroupBy(index => (jobs[index].Gap.Start,
-                        jobs[index].Gap.NextContact, jobs[index].Gap.Defender))
-                    .OrderByDescending(group => group.Count())
-                    .ThenBy(group => group.Min()).ToArray();
-                var mainCount = 0;
-                var workerCount = 0;
-                foreach (var group in groups)
-                {
-                    if (mainCount > workerCount)
-                    {
-                        foreach (var index in group) workerIndexes.Add(index);
-                        workerCount += group.Count();
-                    }
-                    else mainCount += group.Count();
-                }
-                parallelTrials = workerIndexes.Count;
-            }
-            async Task<List<(int Index, ReplayBranchResult? Branch,
-                EscapeVerdict? Verdict)>> RunWorkerAsync()
-            {
-                var completed = new List<(int, ReplayBranchResult?, EscapeVerdict?)>();
-                if (escapeWorker is null) return completed;
-                foreach (var index in workerIndexes.Order())
-                {
-                    if (escapeBatchCancelRequested) break;
-                    var (gap, move) = jobs[index];
-                    try
-                    {
-                        var (branch, verdict) = await ComputeEscapeAsync(escapeWorker.Probe,
-                            original, gap, move, baseline, workerProbeCache, workerFastEngines);
-                        completed.Add((index, branch, verdict));
-                    }
-                    catch (Exception ex)
-                    {
-                        workerFailed = true;
-                        workerError = ex.Message;
-                        completed.Add((index, null, null));
-                        break;
-                    }
-                }
-                return completed;
-            }
-            var workerTask = RunWorkerAsync();
-            for (var jobIndex = 0; jobIndex < jobs.Length; jobIndex++)
-            {
-                if (escapeBatchCancelRequested) break;
-                if (workerIndexes.Contains(jobIndex)) continue;
-                var (gap, move) = jobs[jobIndex];
-                var anchor = EscapeTrial.Anchor(gap, move);
-                try
-                {
-                    if (TryCachedEscapeTrial(activeProbe, original, gap, move,
-                        out var cached))
-                    {
-                        batchResults.Add((jobIndex, cached));
-                    }
-                    else
-                    {
-                        var stepStarted = timer.ElapsedMilliseconds;
-                        engineTouched = true;
-                        var (branch, verdict) = await ComputeEscapeAsync(activeProbe,
-                            original, gap, move, baseline, mainProbeCache, mainFastEngines);
-                        trialMilliseconds += timer.ElapsedMilliseconds - stepStarted;
-                        var result = new EscapeTrialResult(anchor, gap.Defender, move, verdict,
-                            original, branch.ReplayPath, branch.End, branch.MatchedInputFrames);
-                        batchResults.Add((jobIndex, result));
-                        if (ReferenceEquals(baseline, original) &&
-                            !ReferenceEquals(cachedEscapeProbe, activeProbe))
-                            RememberEscapeBaseline(activeProbe, baseline);
-                        if (CanReuseEscapeTrial(result))
-                            cachedEscapeTrials[(gap.Start, gap.NextContact,
-                                gap.Defender, move)] = result;
-                        try
-                        {
-                            var hash = ReplayHeader.Read(branch.ReplayPath).Hash;
-                            File.Delete(System.IO.Path.Combine(root, "trace_" + hash + ".csv"));
-                        }
-                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                        { /* The generated trace can be retained. */ }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    executionErrors++;
-                    batchResults.Add((jobIndex, new(anchor, gap.Defender, move,
-                        new EscapeVerdict("未判定", $"执行失败：{ex.Message}"),
-                        original, "", anchor, 0)));
-                    try
-                    {
-                        var state = activeProbe.Read();
-                        if (state.Sequence != state.Acknowledged || state.Status < 0)
-                        {
-                            stopReason = "探针在试验失败后未恢复可接收命令的状态。";
-                            break;
-                        }
-                    }
-                    catch (Exception recovery)
-                    {
-                        stopReason = $"读取探针状态失败：{recovery.Message}";
-                        break;
-                    }
-                }
-                escapeBatchDone++;
-                if (escapeProgressLabel is not null)
-                    escapeProgressLabel.Text = $"已完成 {escapeBatchDone}/{escapeBatchTotal} 处，执行错误 {executionErrors} 处；" +
-                        "可在当前试验结束后取消。";
-                await Task.Yield();
-            }
-            var workerCompleted = await workerTask;
-            parallelTrials = workerCompleted.Count(item => item.Branch is not null);
-            if (workerFailed && escapeWorker is not null)
-            {
-                try { await escapeWorker.DisposeAsync(); }
-                catch (Exception ex) { workerError = ex.Message; }
-                finally { escapeWorker = null; }
-            }
-            foreach (var index in workerIndexes.Order())
-            {
-                if (escapeBatchCancelRequested) break;
-                var (gap, move) = jobs[index];
-                var entry = workerCompleted.FirstOrDefault(item => item.Index == index);
-                try
-                {
-                    ReplayBranchResult branch;
-                    EscapeVerdict verdict;
-                    if (entry.Branch is not null && entry.Verdict is not null)
-                    {
-                        branch = entry.Branch;
-                        verdict = entry.Verdict;
-                    }
-                    else
-                    {
-                        engineTouched = true;
-                        (branch, verdict) = await ComputeEscapeAsync(activeProbe,
-                            original, gap, move, baseline, mainProbeCache, mainFastEngines);
-                    }
-                    var anchor = EscapeTrial.Anchor(gap, move);
-                    var result = new EscapeTrialResult(anchor, gap.Defender, move, verdict,
-                        original, branch.ReplayPath, branch.End, branch.MatchedInputFrames);
-                    batchResults.Add((index, result));
-                    if (CanReuseEscapeTrial(result))
-                        cachedEscapeTrials[(gap.Start, gap.NextContact,
-                            gap.Defender, move)] = result;
-                    try
-                    {
-                        var hash = ReplayHeader.Read(branch.ReplayPath).Hash;
-                        File.Delete(System.IO.Path.Combine(root, "trace_" + hash + ".csv"));
-                    }
-                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                    { }
-                }
-                catch (Exception ex)
-                {
-                    executionErrors++;
-                    var anchor = EscapeTrial.Anchor(gap, move);
-                    batchResults.Add((index, new(anchor, gap.Defender, move,
-                        new EscapeVerdict("未判定", $"执行失败：{ex.Message}"),
-                        original, "", anchor, 0)));
-                }
-                escapeBatchDone++;
-                if (escapeProgressLabel is not null)
-                    escapeProgressLabel.Text = $"已完成 {escapeBatchDone}/{escapeBatchTotal} 处，执行错误 {executionErrors} 处；" +
-                        "可在当前试验结束后取消。";
-            }
-            trialMilliseconds = timer.ElapsedMilliseconds - baselineMilliseconds;
-        }
-        catch (Exception ex)
-        {
-            stopReason = $"批量基线校验失败：{ex.Message}";
-        }
-        finally
-        {
-            foreach (var entry in batchResults.OrderBy(entry => entry.Index))
-                StoreEscapeResult(entry.Result);
-            try
-            {
-                if (engineTouched)
-                {
-                    var stepStarted = timer.ElapsedMilliseconds;
-                    if (mainFastEngines.TryGetValue(activeProbe, out var engine))
-                    {
-                        try { probeStatus = await engine.RestoreOriginalAsync(returnCursor); }
-                        catch (Exception ex) when (ex is IOException or InvalidOperationException)
-                        {
-                            probeStatus = await ReplayBranchRunner.RestoreAsync(activeProbe, original, root, returnCursor);
-                        }
-                    }
-                    else probeStatus = await ReplayBranchRunner.RestoreAsync(activeProbe, original, root, returnCursor);
-                    restoreMilliseconds += timer.ElapsedMilliseconds - stepStarted;
-                }
-                session = original;
-                cursor = returnCursor;
-            }
-            catch (Exception ex)
-            {
-                stopReason = $"最终返回原回放失败：{ex.Message}";
-            }
-            message = stopReason is not null ?
-                $"批量推演停在 {escapeBatchDone}/{jobs.Length} 项：{stopReason}" :
-                $"批量推演{(escapeBatchCancelRequested ? "已取消" : "完成")}：" +
-                $"{escapeBatchDone}/{jobs.Length} 项，执行错误 {executionErrors} 项。" +
-                (parallelTrials > 0 ? $" 并行计算 {parallelTrials} 项。" : "") +
-                (workerError is not null ? $" 并行引擎不可用：{workerError}。" : "") +
-                $" 耗时 {timer.Elapsed.TotalSeconds:F1} 秒（基线 {baselineMilliseconds / 1000.0:F1}，" +
-                $"分支 {trialMilliseconds / 1000.0:F1}，恢复 {restoreMilliseconds / 1000.0:F1}）。";
-            escapeBusy = false;
-            escapeBatchTotal = 0;
-            escapeBatchCancelRequested = false;
-            Render();
-        }
-    }
-
     public async Task<(int Completed, int Total, int Success, int Failures,
         int Unresolved, int ExecutionErrors, string Message,
         string[] Verdicts)> SmokeEscapeBatchAsync(int count, int skip = 0, string move = "4A")
@@ -3030,24 +2099,23 @@ public sealed partial class MainWindow : Window
         if (session is null) throw new InvalidOperationException("未导入原回放。");
         escapeMove = move;
         escapeDefender = -1;
-        minPressureMoves = 1;
-        var gaps = EscapeTrial.EligibleGaps(session, -1, escapeMove, minPressureMoves)
+        var pressures = PressureSelection.Select(session, minPressureMoves)
             .Skip(skip).Take(count).ToArray();
-        if (gaps.Length != count) throw new InvalidOperationException("可测试空隙不足。");
-        await RunEscapeBatchAsync(gaps.Select(gap => (Gap: gap, Move: move)).ToArray());
+        if (pressures.Length != count) throw new InvalidOperationException("符合压制总表设置的压制不足。");
+        await RunPressureEscapeAsync(pressures.Select(p => new PressureEscapeJob(p, move)).ToArray());
         var recent = escapeBatchDone == 0 ? [] : escapeResults.TakeLast(escapeBatchDone).ToArray();
         return (escapeBatchDone, recent.Length,
             recent.Count(x => x.Verdict.Result == "成功"),
-            recent.Count(x => x.Verdict.Result == "失败"),
-            recent.Count(x => x.Verdict.Result == "未判定"),
-            recent.Count(x => x.Verdict.Reason.StartsWith("执行失败：", StringComparison.Ordinal)),
+            recent.Count(x => x.Verdict.Result is "未找到" or "受击" or "仍受压" or "未发动"),
+            recent.Count(x => x.Verdict.Result is "未判定" or "不可执行" or "已取消"),
+            recent.Count(x => x.Verdict.Result == "执行错误"),
             message ?? "", recent.Select(x => $"{x.Anchor}:{x.Defender}:{x.Move}:" +
                 $"{x.Verdict.Result}:{x.Verdict.Reason}:{x.MatchedInputFrames}").ToArray());
     }
 
-    private async Task OpenEscapeResultAsync(EscapeTrialResult result, int? ordinal = null)
+    private async Task OpenEscapeResultAsync(EscapeTrialResult result, int? ordinal = null, bool play = false)
     {
-        if (escapeBusy || branchBusy || fullCaptureBusy) return;
+        if (PlaybackOperationBlocked || ReplayControlInFlight) return;
         if (probe is null || !File.Exists(result.ReplayPath))
         {
             message = "该结果的分支 REP 不存在，或游戏探针未连接。";
@@ -3057,18 +2125,27 @@ public sealed partial class MainWindow : Window
         PausePlayback();
         ClearNativeSnapshots();
         Render();
+        await playbackControlGate.WaitAsync();
         try
         {
+            if (shutdownInProgress || shutdownReady) return;
             var header = ReplayHeader.Read(result.ReplayPath);
             var hash = header.Hash;
             var trace = System.IO.Path.Combine(root, "trace_" + hash + ".csv");
+            nativeReplaySource = null;
+            nativePlaybackReleased = true;
             await probe.SendAsync(ProbeCommand.Load, replayPath: result.ReplayPath,
                 tracePath: trace);
             probeStatus = await probe.SendAsync(ProbeCommand.Seek, target: result.End);
             session = await Task.Run(() => SessionLoader.Load(result.ReplayPath, root, trace,
                 preloadedHeader: header));
+            nativeReplaySource = session.Source;
+            nativePlaybackReleased = false;
             cursor = Math.Clamp(ordinal ?? result.Anchor, 0, result.End);
             probeStatus = await probe.SendAsync(ProbeCommand.Seek, target: cursor);
+            probeStatus = await probe.SendAsync(ProbeCommand.Speed, (int)Math.Round(playbackSpeed * 100));
+            if (play) probeStatus = await probe.SendAsync(ProbeCommand.Play);
+            AdoptPlaybackPosition(probeStatus);
             branchOriginal = result.Original;
             branchAnchor = result.Anchor;
             selectedEscapeResult = result;
@@ -3082,30 +2159,30 @@ public sealed partial class MainWindow : Window
                 probeStatus = await ReplayBranchRunner.RestoreAsync(probe,
                     result.Original, root, result.Anchor);
                 session = result.Original;
-                cursor = result.Anchor;
+                nativeReplaySource = session.Source;
+                nativePlaybackReleased = false;
+                probeStatus = await probe.SendAsync(ProbeCommand.Speed, (int)Math.Round(playbackSpeed * 100));
+                AdoptPlaybackPosition(probeStatus);
                 branchOriginal = null;
                 message = $"载入推演分支失败，已返回原回放：{ex.Message}";
             }
             catch (Exception recovery)
             {
+                nativeReplaySource = null;
+                nativePlaybackReleased = true;
                 message = $"载入推演分支失败，返回原回放也失败：{ex.Message}；{recovery.Message}";
             }
         }
-        finally { escapeBusy = false; Render(); }
+        finally { escapeBusy = false; playbackControlGate.Release(); Render(); }
     }
 
-    private async Task PlayEscapeResultAsync(EscapeTrialResult result)
-    {
-        await OpenEscapeResultAsync(result);
-        if (probe is null || branchOriginal is null || session?.Source != result.ReplayPath) return;
-        try { probeStatus = await probe.SendAsync(ProbeCommand.Play); }
-        catch (Exception ex) { message = $"推演分支播放失败：{ex.Message}"; }
-        Render();
-    }
+    private Task PlayEscapeResultAsync(EscapeTrialResult result)
+        => OpenEscapeResultAsync(result, play: true);
 
     internal async Task<object> SmokeEscapeResultPlaybackAsync()
     {
-        var result = escapeResults.LastOrDefault() ??
+        var result = escapeResults.LastOrDefault(r => r.Verdict.Result == "成功") ??
+            escapeResults.LastOrDefault(r => r.MatchedInputFrames == r.End - r.Anchor && File.Exists(r.ReplayPath)) ??
             throw new InvalidDataException("没有可核验的推演结果。");
         var count = escapeResults.Count;
         StoreEscapeResult(result);
@@ -3122,13 +2199,24 @@ public sealed partial class MainWindow : Window
         var trace = System.IO.Path.Combine(root, "trace_" + session.Header!.Hash + ".csv");
         var actual = TraceReader.Read(trace);
         var expected = ReplayInputAligner.ReadInputWindow(result.ReplayPath,
-            result.Original.Frames, result.Anchor, result.Defender, 90);
+            result.Original.Frames, result.Anchor, result.Defender, result.End - result.Anchor);
         var matched = Enumerable.Range(0, expected.Length).Count(index =>
             actual[result.Anchor + 1 + index].Side(result.Defender).Input == expected[index]);
         if (matched != expected.Length) throw new InvalidDataException("播放分支未应用预期逃压输入。");
+        var simulatedTrace = System.IO.Path.ChangeExtension(result.ReplayPath, ".csv");
+        var stateMismatches = 0;
+        if (File.Exists(simulatedTrace))
+        {
+            var simulated = TraceReader.ReadTailWithPrefix(simulatedTrace,
+                result.Original.Frames, result.Anchor);
+            for (var i = result.Anchor; i <= result.End; i++)
+                if (!ReplayBranchRunner.SameState(simulated[i], actual[i])) stateMismatches++;
+            if (stateMismatches > 0)
+                throw new InvalidDataException($"技能 REP 播放与推演状态不一致：{stateMismatches} 帧。");
+        }
         return new { ResultCount = count, PlaybackSource = session.Source,
             OriginalSource = result.Original.Source, result.Move, result.Anchor,
-            AppliedInputFrames = matched, SourceIsBranch = true };
+            AppliedInputFrames = matched, StateMismatches = stateMismatches, SourceIsBranch = true };
     }
     private void InterpretPage()
     {
@@ -3292,10 +2380,72 @@ public sealed partial class MainWindow : Window
         catch (Exception ex) { message = $"多局统计导出失败：{ex.Message}"; }
         Render();
     }
+    private static readonly (string Id, string Title, Size Minimum)[] ReplayPanelOptions = [
+        ("game", "对局画面与当前状态", new(420, 360)),
+        ("playback", "压制缝提示", new(300, 220)),
+        ("snapshot", "固定快照", new(300, 180)),
+        ("quick", "快速定位", new(300, 180)),
+        ("bookmarks", "时间标记", new(300, 160))
+    ];
+    private ReplayDockLayout EditableReplayLayout()
+    {
+        var slots = ReplayPanelOptions.Select((p, i) => new ReplayDockSlot("home-" + p.Id,
+            i == 0 ? new(0, 0, .66, 1) : new ReplayPanelLayout(.67, (i - 1) * .25, .33, .25),
+            [p.Id], p.Id)).ToArray();
+        var fallback = new ReplayDockState(1, 1100, 1000, slots,
+            slots.ToDictionary(s => s.Active!, s => s.Id));
+        var model = new ReplayDockLayout(fallback, ReplayPanelOptions.ToDictionary(p => p.Id, p => p.Minimum));
+        if (replayDockDefaultState is not null) model.Restore(replayDockDefaultState);
+        if (replayDockState is not null) model.Restore(replayDockState);
+        return model;
+    }
+    private bool SetReplayPanelEnabled(string id, bool enabled)
+    {
+        if (ReplayControlInFlight || PlaybackOperationBlocked) return false;
+        if (replayWorkspace is not null)
+        {
+            var open = replayWorkspace.Layout.State.Slots.Any(s => s.Panels.Contains(id));
+            return open == enabled || (enabled ? replayWorkspace.OpenPanel(id) : replayWorkspace.ClosePanel(id));
+        }
+        var model = EditableReplayLayout();
+        var visible = model.State.Slots.Any(s => s.Panels.Contains(id));
+        if (visible == enabled) return true;
+        if (!(enabled ? model.Open(id) : model.Close(id))) return false;
+        replayDockState = ReplayDockLayout.Copy(model.State);
+        SaveSettings();
+        return true;
+    }
+    private void ReplayPanelSettingsPage()
+    {
+        var state = replayWorkspace?.Layout.State ?? EditableReplayLayout().State;
+        var options = new StackPanel();
+        var feedback = Text("", 12, Muted);
+        foreach (var panel in ReplayPanelOptions)
+        {
+            var check = new CheckBox { Content = panel.Title,
+                IsChecked = state.Slots.Any(s => s.Panels.Contains(panel.Id)),
+                Margin = new Thickness(0, 0, 0, 14), FontSize = 13 };
+            var updating = false;
+            void ChangeVisibility()
+            {
+                if (updating) return;
+                if (SetReplayPanelEnabled(panel.Id, check.IsChecked == true))
+                { feedback.Text = "已保存，返回回放页即可使用。"; return; }
+                updating = true; check.IsChecked = check.IsChecked != true; updating = false;
+                feedback.Text = "当前回放任务执行中，完成后可调整面板。";
+            }
+            check.Checked += (_, _) => ChangeVisibility();
+            check.Unchecked += (_, _) => ChangeVisibility();
+            options.Children.Add(check);
+        }
+        content.Children.Add(Card("回放面板", Vertical(
+            Text("勾选开启面板；回放页点击 × 关闭。拖动面板标题调整位置，拖动分隔线调整大小。", 12, Muted),
+            options, feedback)));
+    }
     private void SettingsPage()
     {
         var sections = new WrapPanel();
-        foreach (var name in new[] { "基础修改", "皮肤", "快捷键", "功能启用", "大小" })
+        foreach (var name in new[] { "基础修改", "皮肤", "快捷键", "回放面板", "功能启用", "大小" })
         {
             var selected = name;
             sections.Children.Add(Button(name, () => {
@@ -3326,6 +2476,7 @@ public sealed partial class MainWindow : Window
         }
         else if (settingsSection == "皮肤") SkinSettingsPage();
         else if (settingsSection == "快捷键") ShortcutSettingsPage();
+        else if (settingsSection == "回放面板") ReplayPanelSettingsPage();
         else if (settingsSection == "功能启用")
         {
             var toggles = new WrapPanel();
@@ -3435,9 +2586,15 @@ public sealed partial class MainWindow : Window
             if (saved.AuditSide is >= -1 and <= 1) auditSide = saved.AuditSide.Value;
             if (!string.IsNullOrWhiteSpace(saved.AuditKind) && saved.AuditKind.Length <= 64)
                 auditKind = saved.AuditKind;
-            if (saved.SettingsSection is "基础修改" or "皮肤" or "快捷键" or "功能启用" or "大小")
+            if (saved.SettingsSection is "基础修改" or "皮肤" or "快捷键" or "回放面板" or "功能启用" or "大小")
                 settingsSection = saved.SettingsSection;
             showReplayTools = saved.ShowReplayTools;
+            replayDockState = saved.ReplayDock;
+            replayDockDefaultState = saved.ReplayDockDefault;
+            if (saved.ReplayWorkspaces is not null)
+                foreach (var (name, workspace) in saved.ReplayWorkspaces.Take(30))
+                    if (workspace is not null && name.Length is > 0 and <= 60)
+                        replayDockWorkspaces[name] = workspace;
             autoConnectOnLaunch = saved.AutoConnectOnLaunch ?? true;
             if (saved.ReplayPanels is not null)
                 foreach (var (id, layout) in saved.ReplayPanels)
@@ -3470,12 +2627,22 @@ public sealed partial class MainWindow : Window
         }
         catch { /* Invalid settings use defaults. */ }
     }
+    private void InvalidateSettingsViews()
+    {
+        // Global display settings affect every page. Page-local filters and
+        // playback/bookmark persistence must not discard unrelated views.
+        if (page == 9) pageCache.Clear();
+        else pageCache.Remove(page);
+    }
     private void SaveSettings()
     {
-        pageCache.Clear();
+        InvalidateSettingsViews();
         try
         {
-            File.WriteAllText(SettingsPath,
+            var stagedSettings = SettingsPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+            File.WriteAllText(stagedSettings,
                 JsonSerializer.Serialize(new SavedSettings(expert, enabled, chartEnabled,
                     showReplayTools, gapThreshold,
                     bookmarks.ToDictionary(x => x.Key, x => x.Value.ToArray()), skin,
@@ -3484,7 +2651,11 @@ public sealed partial class MainWindow : Window
                     replayPanelLayouts, curveCardWidth, playbackSpeed, statsSide,
                     statsRound, statsCategory, multiCategory, comboShowDashes,
                     minPressureMoves, escapeDefender, escapeOnlySuccess, escapeMove,
-                    interpretSide, auditSide, auditKind, settingsSection, customColors, exitTakeoverKey.ToString())));
+                    interpretSide, auditSide, auditKind, settingsSection, customColors, exitTakeoverKey.ToString(),
+                    replayDockState, replayDockWorkspaces, replayDockDefaultState)));
+            File.Move(stagedSettings, SettingsPath, overwrite: true);
+            }
+            finally { if (File.Exists(stagedSettings)) File.Delete(stagedSettings); }
         }
         catch (Exception ex) { message = $"设置保存失败：{ex.Message}"; }
     }
@@ -3504,7 +2675,10 @@ public sealed partial class MainWindow : Window
         int? InterpretSide = null, int? AuditSide = null, string? AuditKind = null,
         string? SettingsSection = null,
         Dictionary<string, Dictionary<string, string>>? CustomColors = null,
-        string? ExitTakeoverKey = null);
+        string? ExitTakeoverKey = null,
+        ReplayDockState? ReplayDock = null,
+        Dictionary<string, ReplayDockState>? ReplayWorkspaces = null,
+        ReplayDockState? ReplayDockDefault = null);
     private async void Import()
     {
         var dialog = new OpenFileDialog {
@@ -3526,7 +2700,7 @@ public sealed partial class MainWindow : Window
 
     private async Task<bool> ConnectGameAsync(bool analyzePendingReplay, int? targetPid = null)
     {
-        if (probeConnecting) return false;
+        if (shutdownInProgress || shutdownReady || ReplayControlInFlight || branchBusy || escapeBusy || fullCaptureBusy || probeConnecting) return false;
         probeConnecting = true;
         ConnectionTrace.Write("connect.begin", targetPid ?? 0);
         try
@@ -3543,6 +2717,7 @@ public sealed partial class MainWindow : Window
             var games = await Task.Run(GameDiscovery.FindProcesses)
                 .WaitAsync(TimeSpan.FromSeconds(8));
             ConnectionTrace.Write("discovery.done", targetPid ?? 0, $"candidates={games.Count}");
+            if (shutdownInProgress || shutdownReady) return false;
             AttachGame(targetPid is null ? games.FirstOrDefault() :
                 games.FirstOrDefault(game => game.Pid == targetPid));
             ConnectionTrace.Write("reader.attached", detectedGame?.Pid ?? 0,
@@ -3566,7 +2741,12 @@ public sealed partial class MainWindow : Window
             Render();
             ClearNativeSnapshots();
             ConnectionTrace.Write("probe.attach.begin", detectedGame.Pid);
-            probe = await ProbeClient.AttachAsync(detectedGame, root);
+            var attachedProbe = await ProbeClient.AttachAsync(detectedGame, root);
+            if (shutdownInProgress || shutdownReady) { attachedProbe.Dispose(); return false; }
+            probe?.Dispose();
+            probe = attachedProbe;
+            nativeReplaySource = null;
+            nativePlaybackReleased = true;
             ConnectionTrace.Write("probe.attach.done", detectedGame.Pid);
             probeStatus = probe.Read();
             embedFailed = false;
@@ -3599,13 +2779,14 @@ public sealed partial class MainWindow : Window
     }
     private async void StartGame()
     {
-        if (gameStarting) return;
+        if (shutdownInProgress || shutdownReady || probeConnecting || ReplayControlInFlight || branchBusy || escapeBusy || fullCaptureBusy || sessionLoading || gameStarting) return;
         gameStarting = true;
         ConnectionTrace.Write("launch.begin");
         try
         {
             var existing = await Task.Run(GameDiscovery.FindProcesses)
                 .WaitAsync(TimeSpan.FromSeconds(8));
+            if (shutdownInProgress || shutdownReady) return;
             if (existing.Count > 0)
             {
                 if (await Task.Run(() => existing.Any(g =>
@@ -3704,6 +2885,8 @@ public sealed partial class MainWindow : Window
             probe.Dispose();
             probe = null;
             probeStatus = null;
+            nativeReplaySource = null;
+            nativePlaybackReleased = true;
             ClearNativeSnapshots();
         }
         liveTimer.Stop();
@@ -3742,16 +2925,20 @@ public sealed partial class MainWindow : Window
     }
     private async void LoadRepIntoGame()
     {
-        if (fullCaptureBusy) return;
+        if (PlaybackOperationBlocked || ReplayControlInFlight) return;
         if (probe is null || session?.Header is null) {
             message = "先导入 REP，并连接探针。"; Render(); return;
         }
+        nativeTransportBusy = true;
+        await playbackControlGate.WaitAsync();
         try
         {
+            if (shutdownInProgress || shutdownReady) return;
             await LoadCurrentRepIntoGameAsync();
             message = "游戏已载入 REP；探针正在记录逐帧轨迹。";
         }
         catch (Exception ex) { message = $"游戏载入 REP 失败：{ex.Message}"; }
+        finally { nativeTransportBusy = false; playbackControlGate.Release(); UpdateTransport(); }
         Render();
     }
     private async void CaptureFullReplay() => await CaptureFullReplayAsync();
@@ -3766,7 +2953,7 @@ public sealed partial class MainWindow : Window
 
     private async Task CaptureFullReplayAsync()
     {
-        if (fullCaptureBusy || branchBusy || escapeBusy || recordingInput ||
+        if (shutdownInProgress || shutdownReady || ReplayControlInFlight || fullCaptureBusy || branchBusy || escapeBusy ||
             branchOriginal is not null || probe is null || session?.Header is null)
             return;
         fullCaptureBusy = true;
@@ -3777,8 +2964,10 @@ public sealed partial class MainWindow : Window
         SetImportProgress(0, session.Header.InputFrames);
         message = "正在快速计算完整 REP；跳过游戏画面绘制，逐帧记录引擎状态。";
         Render();
+        await playbackControlGate.WaitAsync();
         try
         {
+            if (shutdownInProgress || shutdownReady) return;
             await LoadCurrentRepIntoGameAsync();
             if (fullCaptureCancelRequested) throw new OperationCanceledException();
             probeStatus = await probe.SendAsync(ProbeCommand.Capture);
@@ -3822,7 +3011,6 @@ public sealed partial class MainWindow : Window
                 if (File.Exists(staged)) File.Delete(staged);
             }
             session.TraceOrigin = "已验证的完整实机轨迹";
-            RememberEscapeBaseline(probe, session);
             var savedIndex = samples.FindIndex(x => string.Equals(
                 System.IO.Path.GetFullPath(x.Source), System.IO.Path.GetFullPath(session.Source),
                 StringComparison.OrdinalIgnoreCase));
@@ -3855,9 +3043,19 @@ public sealed partial class MainWindow : Window
                 message = $"完整采集已取消，但暂停游戏回放失败：{ex.Message}";
             }
         }
-        catch (Exception ex) { message = $"完整采集失败：{ex.Message}"; }
+        catch (Exception ex)
+        {
+            message = $"完整采集失败：{ex.Message}";
+            try
+            {
+                if (probe is not null && probe.Read().Status is 1 or 2)
+                    probeStatus = await probe.SendAsync(ProbeCommand.Pause);
+            }
+            catch (Exception pauseError) { message += $" 暂停回放失败：{pauseError.Message}"; }
+        }
         finally
         {
+            playbackControlGate.Release();
             fullCaptureBusy = false;
             fullCaptureCancelRequested = false;
             importProgressText = null;
@@ -3918,50 +3116,32 @@ public sealed partial class MainWindow : Window
         escapeResults.Clear();
         selectedEscapeResult = null;
         var trace = System.IO.Path.Combine(root, "trace_" + session.Header.Hash + ".csv");
+        nativeReplaySource = null;
+        nativePlaybackReleased = true;
         probeStatus = await probe.SendAsync(ProbeCommand.Load,
             replayPath: session.Source, tracePath: trace);
+        nativeReplaySource = session.Source;
+        nativePlaybackReleased = false;
+        probeStatus = await probe.SendAsync(ProbeCommand.Seek, 0);
+        probeStatus = await probe.SendAsync(ProbeCommand.Speed, (int)Math.Round(playbackSpeed * 100));
+        AdoptPlaybackPosition(probeStatus);
     }
-    private async void ProbeCommandRun(ProbeCommand command, int target = -1)
-    {
-        if (probe is null || fullCaptureBusy) return;
-        try
-        {
-            PausePlayback();
-            if (command is ProbeCommand.Release or ProbeCommand.Load ||
-                command == ProbeCommand.Seek && probeStatus is not null && target < probeStatus.Ordinal)
-                ClearNativeSnapshots();
-            probeStatus = await probe.SendAsync(command, target);
-            if (command is ProbeCommand.Pause or ProbeCommand.Seek)
-                await RefreshSessionFromProbe();
-            message = command switch {
-                ProbeCommand.Play => "游戏回放继续播放。",
-                ProbeCommand.Pause => "游戏回放已暂停；逐帧轨迹已刷新。",
-                ProbeCommand.Seek => $"游戏回放已定位到轨迹帧 {probeStatus.Ordinal:N0}。",
-                ProbeCommand.Release => "已请求探针释放回放并返回标题界面。",
-                _ => null
-            };
-        }
-        catch (Exception ex) { message = $"游戏回放命令失败：{ex.Message}"; }
-        Render();
-    }
-    private async void SetGameSpeed(double rate)
-    {
-        if (probe is null || fullCaptureBusy || probeStatus?.Status is not (2 or 3)) return;
-        try
-        {
-            probeStatus = await probe.SendAsync(ProbeCommand.Speed, target: (int)(rate * 100));
-            message = $"游戏回放速度已设为 {rate:0.##}×。";
-        }
-        catch (Exception ex) { message = $"游戏调速失败：{ex.Message}"; }
-        Render();
-    }
+    private void SetGameSpeed(double rate) => _ = ChangePlaybackSpeedAsync(rate);
+    private int sessionRefreshVersion;
     private async Task RefreshSessionFromProbe()
     {
         if (session?.Header is null) return;
-        var source = session.Source;
+        var originalSession = session;
+        var originalProbe = probe;
+        var refreshVersion = ++sessionRefreshVersion;
+        var source = originalSession.Source;
         var nativeTrace = System.IO.Path.Combine(root,
-            "trace_" + session.Header.Hash + ".csv");
-        var updated = await Task.Run(() => SessionLoader.Load(source, root, nativeTrace));
+            "trace_" + originalSession.Header.Hash + ".csv");
+        var updated = await Task.Run(() => SessionLoader.Load(source, root, nativeTrace,
+            preloadedHeader: originalSession.Header));
+        if (refreshVersion != sessionRefreshVersion ||
+            !ReferenceEquals(session, originalSession) || !ReferenceEquals(probe, originalProbe) ||
+            shutdownInProgress || shutdownReady) return;
         if (!fullCaptureBusy && session.TraceOrigin == "已验证的完整实机轨迹" &&
             updated.Frames.Count < session.Frames.Count)
         {
@@ -3980,13 +3160,14 @@ public sealed partial class MainWindow : Window
         try
         {
             probeStatus = probe.Read();
-            if (probeStatus.Status is 2 or 3 && session?.Frames.Count > 0)
+            if (NativeSessionMatches && !PlaybackOperationBlocked && !nativeTransportBusy && pendingSeekTarget is null &&
+                probeStatus.Status is 2 or 3 && session?.Frames.Count > 0)
             {
                 var observed = Math.Clamp(probeStatus.Ordinal, 0, session.Frames.Count - 1);
-                if (replaySlider?.IsMouseCaptureWithin != true)
+                if (replaySlider?.IsMouseCaptureWithin != true && cursor != observed)
                 {
                     cursor = observed;
-                    if (replaySlider is not null) replaySlider.Value = observed;
+                    refreshReplayFrame?.Invoke();
                 }
             }
             gameSurface?.Reconcile();
@@ -4027,21 +3208,13 @@ public sealed partial class MainWindow : Window
         try
         {
             gameFocusTimer.Stop(); gameKeyboardFocus?.Dispose(); gameKeyboardFocus = null;
-            playbackTimer.Stop(); liveTimer.Stop(); probeTimer.Stop(); inputTimer.Stop();
-            escapeBatchCancelRequested = true;
+            playbackTimer.Stop(); liveTimer.Stop(); probeTimer.Stop();
+            pressureEscapeCancellation?.Cancel();
             fullCaptureCancelRequested = true;
-            recordingInput = false;
-            if (pendingEscapeWorker is not null)
-            {
-                try { escapeWorker = await pendingEscapeWorker; }
-                catch { /* The startup path closes its own failed game process. */ }
-                finally { pendingEscapeWorker = null; }
-            }
-            if (escapeWorker is not null)
-            {
-                await escapeWorker.DisposeAsync();
-                escapeWorker = null;
-            }
+            if (pressureEscapeTask is { IsCompleted: false }) await pressureEscapeTask;
+            if (sessionLoadTask is { IsCompleted: false }) await sessionLoadTask;
+            await playbackControlGate.WaitAsync();
+            playbackControlGate.Release();
             var games = new Dictionary<int, string>();
             if (detectedGame is not null)
                 games[detectedGame.Pid] = detectedGame.Exe;
@@ -4078,9 +3251,14 @@ public sealed partial class MainWindow : Window
         }
         finally { shutdownInProgress = false; }
     }
-    private async Task Load(string path)
+    private Task Load(string path)
     {
-        if (branchBusy || escapeBusy || fullCaptureBusy || recordingInput || sessionLoading)
+        if (sessionLoadTask is { IsCompleted: false }) return Task.CompletedTask;
+        return sessionLoadTask = LoadSessionAsync(path);
+    }
+    private async Task LoadSessionAsync(string path)
+    {
+        if (shutdownInProgress || shutdownReady || probeConnecting || ReplayControlInFlight || branchBusy || escapeBusy || fullCaptureBusy || sessionLoading)
         {
             message = "当前回放任务正在执行，完成后再切换样本。";
             Render();
@@ -4108,7 +3286,11 @@ public sealed partial class MainWindow : Window
                 preloadedHeader: header));
             if (result.Header is not null)
                 SetImportProgress(result.Frames.Count, result.Header.InputFrames);
+            if (shutdownInProgress || shutdownReady) return;
+            if (probe?.Read().Status == 2) await probe.SendAsync(ProbeCommand.Pause);
+            ResetReplayContext();
             session = result;
+            if (statsRound >= 0 && !result.Stats.Any(x => x.Round == statsRound)) statsRound = -1;
             cursor = 0;
             var existingIndex = samples.FindIndex(x => string.Equals(System.IO.Path.GetFullPath(x.Source),
                 System.IO.Path.GetFullPath(path), StringComparison.OrdinalIgnoreCase));
@@ -4123,6 +3305,7 @@ public sealed partial class MainWindow : Window
                     StringComparison.OrdinalIgnoreCase))
             {
                 if (probe is null) await ConnectGameAsync(false);
+                if (shutdownInProgress || shutdownReady) return;
                 if (probe is not null)
                 {
                     if (NeedsCompleteCapture(result)) await CaptureFullReplayAsync();
@@ -4249,16 +3432,20 @@ public sealed partial class MainWindow : Window
     public async Task SmokeTableWheelAsync(ReplaySession test)
     {
         session = test;
+        statsCategory = "全表";
+        statsSide = -1;
+        statsRound = -1;
         page = 1;
         Render();
         UpdateLayout();
         await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.Background);
-        if (pageScroller is null || pageScroller.ScrollableHeight < 300)
+        if (pageScroller is null || pageScroller.ScrollableHeight <= 0)
             throw new InvalidOperationException("统计页没有形成页面级滚动范围。");
         pageScroller.ScrollToVerticalOffset(200);
         UpdateLayout();
         static DataGrid? FindTable(DependencyObject parent)
         {
+            if (parent is UIElement { Visibility: Visibility.Collapsed }) return null;
             if (parent is DataGrid table) return table;
             for (var i = 0; i < VisualTreeHelper.GetChildrenCount(parent); i++)
             {
@@ -4298,6 +3485,7 @@ public sealed partial class MainWindow : Window
         UpdateLayout();
         static DataGrid? FindTable(DependencyObject parent)
         {
+            if (parent is UIElement { Visibility: Visibility.Collapsed }) return null;
             if (parent is DataGrid found) return found;
             for (var i = 0; i < VisualTreeHelper.GetChildrenCount(parent); i++)
             {
@@ -4364,13 +3552,22 @@ public sealed partial class MainWindow : Window
         if (probe is null || session is null)
             throw new InvalidOperationException("未连接游戏或导入回放。");
         var original = session;
-        var gap = EscapeTrial.EligibleGaps(original, -1, move, 1)
+        var pressure = PressureSelection.Select(original, minPressureMoves)
             .Skip(candidateIndex).FirstOrDefault()
-            ?? throw new InvalidOperationException($"回放中没有可尝试 {move} 的空隙。");
-        var (branch, verdict) = await ComputeEscapeAsync(probe, original, gap, move);
-        await ReplayBranchRunner.RestoreAsync(probe, original, root, 0);
-        return (EscapeTrial.Anchor(gap, move), gap.Defender, move,
-            verdict.Result, verdict.Reason, branch.MatchedInputFrames, branch.End);
+            ?? throw new InvalidOperationException("没有符合压制总表设置的压制。");
+        var job = new PressureEscapeJob(pressure, move);
+        var plans = PressureEscapeSimulation.Plans(original, job);
+        if (plans.Count == 0) throw new InvalidOperationException("缺少可验证的输入时机。");
+        var runner = new PressureEscapeRunner(original, new EscapeSimulationGameEngine(probe, original, root));
+        try
+        {
+            await runner.StartAsync(plans.Max(p => p.Anchor + p.Inputs.Length));
+            var result = await runner.RunAsync(job, () => false);
+            StoreEscapeResult(result);
+            return (result.Anchor, result.Defender, move, result.Verdict.Result,
+                result.Verdict.Reason, result.MatchedInputFrames, result.End);
+        }
+        finally { await runner.RestoreAsync(0); probeStatus = probe.Read(); }
     }
 
     public (bool Attached, long HostHandle) SmokeConnectResident(GameInstance game, ReplaySession test)
@@ -4395,6 +3592,8 @@ public sealed partial class MainWindow : Window
         probeStatus = await probe.SendAsync(ProbeCommand.Load,
             replayPath: session.Source, tracePath: trace);
         probeStatus = await probe.SendAsync(ProbeCommand.Seek, target: 400);
+        nativeReplaySource = session.Source;
+        nativePlaybackReleased = false;
         await RefreshSessionFromProbe();
         cursor = 400;
         page = 0;
@@ -4440,7 +3639,7 @@ public sealed partial class MainWindow : Window
             UpdateLayout();
             return watch.ElapsedMilliseconds;
         }
-        UIElement LastChild() => content.Children[content.Children.Count - 1];
+        UIElement LastChild() => content.Children.Cast<UIElement>().Last(element => element.Visibility != Visibility.Collapsed);
         var stats = Visit(1);
         var statsBody = LastChild();
         var multi = Visit(2);
@@ -4453,10 +3652,18 @@ public sealed partial class MainWindow : Window
         var reusedMulti = ReferenceEquals(multiBody, LastChild());
         var cachedCurves = Visit(3);
         var reusedCurves = ReferenceEquals(curvesBody, LastChild());
+        // Ordinary playback renders and persistence must preserve other pages.
+        NavigateToPage(0);
+        Render();
+        InvalidateSettingsViews();
+        NavigateToPage(1);
+        if (!ReferenceEquals(statsBody, LastChild()))
+            throw new InvalidOperationException("回放页刷新或保存播放设置清空了统计页缓存。");
         NavigateToPage(1);
         statsCategory = "防御";
         Render();
         var invalidated = !ReferenceEquals(statsBody, LastChild());
+        shutdownReady = true; // This diagnostic has no game session to close.
         return (stats, multi, curves, cachedStats, cachedMulti, cachedCurves,
             reusedStats, reusedMulti, reusedCurves, invalidated);
     }
@@ -4471,6 +3678,9 @@ public sealed partial class MainWindow : Window
         var visual = (FrameworkElement)Content;
         visual.Measure(new Size(1440, 900));
         visual.Arrange(new Rect(0, 0, 1440, 900));
+        visual.UpdateLayout();
+        // Finish coalesced curve drawing before taking the diagnostic image.
+        Dispatcher.Invoke(() => { }, DispatcherPriority.Render);
         visual.UpdateLayout();
         if (scrollOffset > 0)
         {

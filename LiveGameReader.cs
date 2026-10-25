@@ -79,7 +79,9 @@ public sealed class LiveGameReader : IDisposable
             var before = ReadU32(battle + 4);
             var matchState = ReadI32(battle + 0x88);
             var round = unchecked((sbyte)ReadU8(battle + 0x904));
-            var weather = checked((int)ReadU32(WeatherAddress));
+            var weatherValue = ReadU32(WeatherAddress);
+            if (weatherValue > 32) return false;
+            var weather = (int)weatherValue;
             var p1 = ReadFighter(left);
             var p2 = ReadFighter(right);
             var after = ReadU32(battle + 4);

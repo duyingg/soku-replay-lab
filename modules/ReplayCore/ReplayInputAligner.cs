@@ -48,9 +48,10 @@ public static class ReplayInputAligner
         var count = (bytes.Length - payload) / 4;
         const int history = 30;
         var candidates = new List<int>();
-        for (var index = 0; index + history < count; index++)
+        var firstCandidate = Math.Max(0, anchor - 300 - history + 1);
+        var lastCandidate = Math.Min(count - history - 1, anchor + 30 - history + 1);
+        for (var index = firstCandidate; index <= lastCandidate; index++)
         {
-            if (anchor - (index + history - 1) is < -30 or > 300) continue;
             var matched = true;
             for (var j = 0; j < history; j++)
             {
@@ -65,6 +66,21 @@ public static class ReplayInputAligner
                 }
             }
             if (matched) candidates.Add(index + history);
+        }
+        // Held directions can produce several identical 30-frame windows.
+        // Extend backwards within this round until an earlier input edge makes
+        // the match unique; never guess which repeated window is correct.
+        for (var extra = history; candidates.Count > 1 && extra <= Math.Min(anchor, 600); extra++)
+        {
+            var observed = frames[anchor - extra];
+            if (observed.MatchState != 2 || observed.Round != frames[anchor].Round) break;
+            candidates.RemoveAll(next => {
+                var index = next - extra - 1;
+                if (index < 0) return true;
+                var offset = payload + index * 4;
+                return BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(offset)) != observed.P1.Input ||
+                    BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(offset + 2)) != observed.P2.Input;
+            });
         }
         if (candidates.Count != 1)
             throw new InvalidDataException($"REP 输入与引擎轨迹无法唯一对齐（候选 {candidates.Count}）。");

@@ -381,6 +381,7 @@ public static class TraceReader
         string? line;
         var lineNumber = 1;
         var dataRows = 0;
+        var row = new CsvRow(names.Count);
         while ((line = reader.ReadLine()) is not null)
         {
             lineNumber++;
@@ -390,7 +391,7 @@ public static class TraceReader
                 continue;
             }
             dataRows++;
-            var row = ParseCsv(line);
+            row.Read(line);
             if (row.Count != names.Count)
                 throw new InvalidDataException($"轨迹第 {lineNumber} 行字段数量错误。");
             int I(int column, int fallback = 0) =>
@@ -401,9 +402,14 @@ public static class TraceReader
                     ? double.Parse(row[column], CultureInfo.InvariantCulture) : 0;
             int[]? Cards(int column)
             {
-                if (column < 0 || row[column] == "?") return null;
+                if (column < 0 || row[column].SequenceEqual("?")) return null;
                 if (row[column].Length == 0) return [];
-                return row[column].Split('|').Select(x => int.Parse(x, CultureInfo.InvariantCulture)).ToArray();
+                var cards = row[column];
+                var result = new int[cards.Count('|') + 1];
+                var next = 0;
+                foreach (var part in cards.Split('|'))
+                    result[next++] = int.Parse(cards[part], CultureInfo.InvariantCulture);
+                return result;
             }
             Fighter FighterAt(int[] c) => new(
                 I(c[0]), D(c[1]), D(c[2]), I(c[3]),
@@ -426,6 +432,39 @@ public static class TraceReader
         if (!tailOnly && dataRows < firstChangedFrame)
             throw new InvalidDataException("分支轨迹短于接管帧。");
         return frames;
+    }
+
+    // Native traces are unquoted numeric CSV. Reuse column offsets instead of
+    // allocating a string for every number; quoted imports keep the CSV parser.
+    private sealed class CsvRow(int capacity)
+    {
+        private readonly Range[] cells = new Range[capacity];
+        private string line = "";
+        private List<string>? quoted;
+        public int Count { get; private set; }
+        public ReadOnlySpan<char> this[int column] => quoted is null
+            ? line.AsSpan(cells[column]) : quoted[column].AsSpan();
+
+        public void Read(string value)
+        {
+            line = value;
+            quoted = null;
+            if (value.Contains('"'))
+            {
+                quoted = ParseCsv(value);
+                Count = quoted.Count;
+                return;
+            }
+            Count = 0;
+            var start = 0;
+            for (var i = 0; i <= value.Length; i++)
+            {
+                if (i < value.Length && value[i] != ',') continue;
+                if (Count < cells.Length) cells[Count] = start..i;
+                Count++;
+                start = i + 1;
+            }
+        }
     }
 
     private static List<string> ParseCsv(string line)

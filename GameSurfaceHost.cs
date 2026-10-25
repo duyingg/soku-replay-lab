@@ -166,6 +166,7 @@ public sealed class GameSurfaceHost : HwndHost
                     nextLayoutAttempt = DateTime.UtcNow.AddSeconds(2);
                 }
                 if (detachRequested) Detach();
+                else if (failure is null && PixelSize() != pixels) Reconcile();
             }));
         });
     }

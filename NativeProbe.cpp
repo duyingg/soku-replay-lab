@@ -11,7 +11,7 @@
 #include <vector>
 #include "NativeCheckpoint.hpp"
 
-// ReplayLab probe protocol v6. All offsets below are for the verified th123.exe 1.10a.
+// ReplayLab probe protocol v8. All offsets below are for the verified th123.exe 1.10a.
 // This DLL must be initialized only after the host validates the executable hash.
 #pragma pack(push, 4)
 struct ProbeChannel {
@@ -26,7 +26,7 @@ static_assert(sizeof(ProbeChannel) == 1080, "Probe protocol size changed");
 
 namespace {
 constexpr LONG kMagic = 0x524c5031; // RLP1
-constexpr LONG kVersion = 6;
+constexpr LONG kVersion = 8;
 constexpr LONG kLoad = 1, kPlay = 2, kPause = 3, kSeek = 4, kRelease = 5,
     kSpeed = 6, kSaveSnapshot = 7, kRestoreSnapshot = 8, kCapture = 9,
     kBranch = 10, kRestoreState = 11, kFreeControl = 12;
@@ -373,8 +373,47 @@ void capture() {
             automatic_slots.insert(static_cast<LONG>(channel->ordinal));
 }
 
+// Use the game's streaming-music pause/resume methods. Stopping only the
+// battle update leaves DirectSound and the decoder thread running. State 3
+// preserves the playback cursor; volume changes would merely hide progression.
+bool music_held = false;
+uint32_t held_music = 0;
+void sync_music(bool hold) {
+    if (!hold && !music_held) return;
+    auto manager = reinterpret_cast<void *>(0x0089FE50);
+    auto lock = reinterpret_cast<CRITICAL_SECTION *>(0x0089FE70);
+    auto lookup = reinterpret_cast<uintptr_t(__thiscall *)(void *, uint32_t)>(0x004045F0);
+    auto pause = reinterpret_cast<void(__thiscall *)(void *, uint32_t)>(0x00403BB0);
+    auto resume = reinterpret_cast<void(__thiscall *)(void *, uint32_t, int)>(0x00403B20);
+    EnterCriticalSection(lock);
+    const auto current = *reinterpret_cast<uint32_t *>(0x00899D5C);
+    if (music_held && (!hold || current != held_music)) {
+        const auto old = lookup(reinterpret_cast<void *>(0x0089FE88), held_music);
+        // Do not undo a stop or a track change performed by the game itself.
+        if (current == held_music && old && *reinterpret_cast<int *>(old + 0x1C) == 3)
+            resume(manager, held_music, 0);
+        music_held = false;
+    }
+    if (hold && !music_held) {
+        const auto bgm = lookup(reinterpret_cast<void *>(0x0089FE88), current);
+        if (bgm && *reinterpret_cast<int *>(bgm + 0x1C) == 0 &&
+            *reinterpret_cast<uint8_t *>(bgm + 0x20)) {
+            pause(manager, current);
+            held_music = current;
+            music_held = true;
+        }
+    }
+    LeaveCriticalSection(lock);
+}
+
+void sync_replay_music() {
+    sync_music(channel && replay_active && channel->status != kPlaying &&
+        channel->status != kIdle);
+}
+
 void acknowledge(LONG status) {
     channel->status = status;
+    sync_replay_music();
     MemoryBarrier();
     channel->acknowledged = channel->sequence;
 }
@@ -876,6 +915,7 @@ int battle_step(void *self) {
         default: acknowledge(-4); break;
         }
     }
+    sync_replay_music();
     if (!replay_active) return original_battle(self);
     if (channel->status == kPaused || channel->status == -5) return 5;
     const bool seeking = channel->status == kLoading &&
@@ -918,7 +958,12 @@ int battle_step(void *self) {
     }
     return result;
 }
-int __fastcall battle_hook(void *self, void *) { return battle_step(self); }
+int __fastcall battle_hook(void *self, void *) {
+    const int result = battle_step(self);
+    // Covers natural replay end and music initialized during the first frame.
+    sync_replay_music();
+    return result;
+}
 
 bool __fastcall battle_render_hook(void *self, void *) {
     if (channel && replay_active && channel->status == kLoading &&
@@ -952,6 +997,71 @@ void restore_slot(uintptr_t address, Function original) {
     VirtualProtect(reinterpret_cast<void *>(address), sizeof(void *), previous, &ignored);
     FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void *>(address), sizeof(void *));
 }
+
+using FindWindowWide = HWND(WINAPI *)(LPCWSTR, LPCWSTR);
+FindWindowWide score_tracker_find_window = nullptr;
+uintptr_t score_tracker_window_slot = 0;
+
+HWND WINAPI find_score_tracker_game_window(LPCWSTR class_name, LPCWSTR window_name) {
+    // FindWindow only searches top-level windows. ScoreTracker lazily creates
+    // its ImGui context on the loading screen, after we may have embedded the
+    // game as a child. Give this one module its own verified game HWND; all
+    // other searches retain the original API semantics.
+    if (!window_name && reinterpret_cast<uintptr_t>(class_name) > 0xffff &&
+        lstrcmpW(class_name, L"th123_110a") == 0) {
+        DWORD owner = 0;
+        wchar_t actual_class[64] = {};
+        if (cursor_target && GetWindowThreadProcessId(cursor_target, &owner) &&
+            owner == GetCurrentProcessId() &&
+            GetClassNameW(cursor_target, actual_class, 64) &&
+            lstrcmpW(actual_class, class_name) == 0)
+            return cursor_target;
+    }
+    return score_tracker_find_window(class_name, window_name);
+}
+
+bool install_score_tracker_window_lookup() {
+    const auto module = GetModuleHandleW(L"ScoreTracker.dll");
+    if (!module || score_tracker_window_slot) return true;
+    const auto base = reinterpret_cast<uintptr_t>(module);
+    if (!readable(base, sizeof(IMAGE_DOS_HEADER))) return false;
+    const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 0x100000)
+        return false;
+    const auto nt_address = base + dos->e_lfanew;
+    if (!readable(nt_address, sizeof(IMAGE_NT_HEADERS32))) return false;
+    const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS32 *>(nt_address);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC) return false;
+    const auto &imports = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!imports.VirtualAddress || imports.Size < sizeof(IMAGE_IMPORT_DESCRIPTOR)) return false;
+    for (size_t offset = 0; offset + sizeof(IMAGE_IMPORT_DESCRIPTOR) <= imports.Size;
+            offset += sizeof(IMAGE_IMPORT_DESCRIPTOR)) {
+        const auto address = base + imports.VirtualAddress + offset;
+        if (!readable(address, sizeof(IMAGE_IMPORT_DESCRIPTOR))) return false;
+        const auto descriptor = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR *>(address);
+        if (!descriptor->Name) break;
+        if (!descriptor->OriginalFirstThunk || !descriptor->FirstThunk) continue;
+        for (size_t index = 0; index < nt->OptionalHeader.SizeOfImage / sizeof(IMAGE_THUNK_DATA32); ++index) {
+            const auto name_address = base + descriptor->OriginalFirstThunk + index * sizeof(IMAGE_THUNK_DATA32);
+            if (!readable(name_address, sizeof(IMAGE_THUNK_DATA32))) return false;
+            const auto name = reinterpret_cast<const IMAGE_THUNK_DATA32 *>(name_address)->u1.AddressOfData;
+            if (!name) break;
+            if (IMAGE_SNAP_BY_ORDINAL32(name)) continue;
+            const auto text = base + name + offsetof(IMAGE_IMPORT_BY_NAME, Name);
+            constexpr char expected[] = "FindWindowW";
+            if (!readable(text, sizeof(expected)) ||
+                std::memcmp(reinterpret_cast<const void *>(text), expected, sizeof(expected)) != 0) continue;
+            const auto slot = base + descriptor->FirstThunk + index * sizeof(IMAGE_THUNK_DATA32);
+            if (!patch_slot(slot, reinterpret_cast<void *>(find_score_tracker_game_window),
+                    &score_tracker_find_window)) return false;
+            score_tracker_window_slot = slot;
+            return true;
+        }
+    }
+    // A different implementation without this import needs no adaptation.
+    return true;
+}
 }
 
 extern "C" __declspec(dllexport) DWORD WINAPI InitializeReplayProbe(void *window_value) {
@@ -963,7 +1073,7 @@ extern "C" __declspec(dllexport) DWORD WINAPI InitializeReplayProbe(void *window
     if (initialized) return 1;
     if (reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)) != 0x00400000) return 0;
     wchar_t name[96] = {};
-    swprintf_s(name, L"Local\\ReplayLabProbeV6_%lu", GetCurrentProcessId());
+    swprintf_s(name, L"Local\\ReplayLabProbeV8_%lu", GetCurrentProcessId());
     mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
         0, sizeof(ProbeChannel), name);
     if (!mapping) return 0;
@@ -972,7 +1082,8 @@ extern "C" __declspec(dllexport) DWORD WINAPI InitializeReplayProbe(void *window
     if (!channel) { CloseHandle(mapping); mapping = nullptr; return 0; }
     std::memset(channel, 0, sizeof(*channel));
     channel->ordinal = -1; channel->engine_frame = -1;
-    if (!patch_slot(0x00857740 + 4, reinterpret_cast<void *>(logo_hook), &original_logo) ||
+    if (!install_score_tracker_window_lookup() ||
+        !patch_slot(0x00857740 + 4, reinterpret_cast<void *>(logo_hook), &original_logo) ||
         !patch_slot(0x00857FAC + 4, reinterpret_cast<void *>(title_hook), &original_title) ||
         !patch_slot(0x008574A0 + 4, reinterpret_cast<void *>(battle_hook), &original_battle) ||
         !patch_slot(0x008574A0 + 8, reinterpret_cast<void *>(battle_render_hook),
@@ -981,6 +1092,8 @@ extern "C" __declspec(dllexport) DWORD WINAPI InitializeReplayProbe(void *window
         restore_slot(0x00857FAC + 4, original_title);
         restore_slot(0x008574A0 + 4, original_battle);
         restore_slot(0x008574A0 + 8, original_battle_render);
+        restore_slot(score_tracker_window_slot, score_tracker_find_window);
+        score_tracker_window_slot = 0;
         UnmapViewOfFile(channel); channel = nullptr;
         CloseHandle(mapping); mapping = nullptr;
         return 0;

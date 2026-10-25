@@ -57,6 +57,7 @@ public static class GameDiscovery
 
     public static void VerifyGameFile(string exe)
     {
+        VerifyExternalGameLocation(exe);
         if (!File.Exists(exe) ||
             !string.Equals(Path.GetFileName(exe), "th123.exe", StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException("请选择非想天则 1.10a 的 th123.exe。");
@@ -64,6 +65,27 @@ public static class GameDiscovery
         var hash = Convert.ToHexString(SHA256.HashData(stream));
         if (!string.Equals(hash, ExpectedSha256, StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException("游戏 EXE 哈希与已验证的 1.10a 版本不一致。");
+    }
+
+    public static void VerifyExternalGameLocation(string exe)
+    {
+        var path = Path.GetFullPath(exe);
+        var roots = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+            Path.GetFullPath(AppContext.BaseDirectory)
+        };
+        foreach (var start in new[] { AppContext.BaseDirectory, Directory.GetCurrentDirectory() })
+        {
+            for (var directory = new DirectoryInfo(start); directory?.Parent is not null; directory = directory.Parent)
+            {
+                if (File.Exists(Path.Combine(directory.FullName, "SokuReplayLab.csproj")) ||
+                    File.Exists(Path.Combine(directory.FullName, "ReplayLabNext.csproj")) ||
+                    Directory.Exists(Path.Combine(directory.FullName, ".git")) ||
+                    File.Exists(Path.Combine(directory.FullName, ".git"))) roots.Add(directory.FullName);
+            }
+        }
+        if (roots.Any(root => path.StartsWith(root.TrimEnd(Path.DirectorySeparatorChar) +
+                Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidDataException("游戏必须位于程序和工作区之外；请直接选择原有本地游戏，不要复制游戏文件。");
     }
 
     public static async Task CloseVerifiedGameAsync(int pid, string expectedExe)

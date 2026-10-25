@@ -24,6 +24,9 @@ art/
 escape_worker_game/
 performance_checks/
 handoff_backups/
+diagnostics/
+tests/*-output/
+tests/navigation-*.json
 v1.0/
 .vs/
 .idea/

@@ -10,18 +10,14 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Program.cs" />
-    <Compile Include="ReplayData.cs" />
-    <Compile Include="ReplayTiming.cs" />
     <Compile Include="ReplayInterpretation.cs" />
     <Compile Include="ReplayInterpretationRuleCheck.cs" />
-    <Compile Include="ComboDetector.cs" />
-    <Compile Include="PressureGapDetector.cs" />
-    <Compile Include="ReplayInputAligner.cs" />
     <Compile Include="ReplayBranchRunner.cs" />
     <Compile Include="InPlaceBranchRunner.cs" />
     <Compile Include="InPlaceLiveCheck.cs" />
     <Compile Include="EscapeTrial.cs" />
-    <Compile Include="EscapeAttemptDetector.cs" />
+    <Compile Include="EscapeSimulationGameEngine.cs" />
+    <Compile Include="MainWindow.EscapeSimulation.cs" />
     <Compile Include="EscapeLiveCheck.cs" />
     <Compile Include="EscapeBatchLiveCheck.cs" />
     <Compile Include="EscapeWorkerGame.cs" />
@@ -30,12 +26,16 @@
     <Compile Include="MainWindow.cs" />
     <Compile Include="MainWindow.Theme.cs" />
     <Compile Include="MainWindow.Takeover.cs" />
+    <Compile Include="MainWindow.Playback.cs" />
     <Compile Include="MainWindow.Shortcuts.cs" />
     <Compile Include="GameKeyboardFocus.cs" />
     <Compile Include="AppTheme.cs" />
     <Compile Include="MainWindow.StatsView.cs" />
     <Compile Include="MainWindow.CurvesView.cs" />
     <Compile Include="ReplayWorkspace.cs" />
+    <Compile Include="ReplayWorkspace.Gestures.cs" />
+    <Compile Include="ReplayWorkspace.Menus.cs" />
+    <Compile Include="ReplayDockLayout.cs" />
     <Compile Include="GameDiscovery.cs" />
     <Compile Include="DisplayGuard.cs" />
     <Compile Include="GameWindowLease.cs" />
@@ -45,16 +45,16 @@
     <Compile Include="EventCsvExporter.cs" />
     <Compile Include="StatsCsvExporter.cs" />
     <Compile Include="LiveGameReader.cs" />
-    <Compile Include="ActionReference.cs" />
-    <Compile Include="ActionCatalog.cs" />
-    <Compile Include="CardTimeline.cs" />
     <Compile Include="CardArt.cs" />
-    <Compile Include="CardNameReference.cs" />
     <Compile Include="StatRules.cs" />
     <Compile Include="ProbeClient.cs" />
     <Compile Include="ProbePreflight.cs" />
     <Compile Include="ProbeLiveCheck.cs" />
     <Compile Include="BranchLiveCheck.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="modules/ReplayCore/SokuReplayLab.ReplayCore.csproj" />
+    <ProjectReference Include="modules/EscapeSimulation/SokuReplayLab.EscapeSimulation.csproj" />
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="ThemeControls.xaml" LogicalName="SokuReplayLab.ThemeControls.xaml" />

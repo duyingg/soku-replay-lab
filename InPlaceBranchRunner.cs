@@ -10,6 +10,7 @@ internal sealed class InPlaceBranchRunner
     private ReplaySession baseline;
     private readonly string root;
     private int? savedAnchor;
+    private readonly SortedSet<int> savedAnchors = [0];
 
     private InPlaceBranchRunner(ProbeClient probe, ReplaySession baseline, string root)
     {
@@ -45,6 +46,9 @@ internal sealed class InPlaceBranchRunner
     {
         var trace = Path.Combine(root, "trace_" + baseline.Header!.Hash + ".csv");
         await probe.SendAsync(ProbeCommand.RestoreState, target: 0, tracePath: trace);
+        savedAnchors.Clear();
+        savedAnchors.Add(0);
+        savedAnchor = null;
         var restored = await probe.SendAsync(ProbeCommand.Seek, target: cursor);
         if (restored.Status != 3 || restored.Ordinal != cursor)
             throw new IOException("快速推演后未恢复原回放位置。");
@@ -56,7 +60,7 @@ internal sealed class InPlaceBranchRunner
     }
 
     internal async Task<ReplayBranchResult> RunAsync(int anchor, int side,
-        IReadOnlyList<ushort> masks)
+        IReadOnlyList<ushort> masks, bool permitInactiveTail = false)
     {
         if (baseline.Header is null || side is not (0 or 1) ||
             anchor < 32 || anchor + masks.Count >= baseline.Frames.Count ||
@@ -65,11 +69,20 @@ internal sealed class InPlaceBranchRunner
         var timer = System.Diagnostics.Stopwatch.StartNew();
         if (savedAnchor != anchor)
         {
-            await probe.SendAsync(ProbeCommand.RestoreState, target: 0);
-            var at = await probe.SendAsync(ProbeCommand.Seek, target: anchor);
-            if (at.Status != 3 || at.Ordinal != anchor)
-                throw new IOException("工作进程未到达分支接管帧。");
-            await probe.SendAsync(ProbeCommand.SaveSnapshot, target: anchor);
+            if (!savedAnchors.Contains(anchor))
+            {
+                // Keep up to the native engine's 16 slots. Seek from the nearest
+                // verified original snapshot rather than replaying from frame 0.
+                var reset = savedAnchors.Count >= 16;
+                var from = reset ? 0 : savedAnchors.GetViewBetween(0, anchor).Max;
+                await probe.SendAsync(ProbeCommand.RestoreState, target: from);
+                if (from == 0) { savedAnchors.Clear(); savedAnchors.Add(0); }
+                var at = await probe.SendAsync(ProbeCommand.Seek, target: anchor);
+                if (at.Status != 3 || at.Ordinal != anchor)
+                    throw new IOException("工作进程未到达分支接管帧。");
+                await probe.SendAsync(ProbeCommand.SaveSnapshot, target: anchor);
+                savedAnchors.Add(anchor);
+            }
             savedAnchor = anchor;
         }
         var prefix = $"inplace_{probe.Pid}_{anchor}_{side}_{Guid.NewGuid():N}";
@@ -79,25 +92,43 @@ internal sealed class InPlaceBranchRunner
             baseline.Source, baseline.Frames, anchor, side, masks, branchPath);
         var header = ReplayHeader.Read(branchPath);
         var prepareMs = timer.ElapsedMilliseconds;
-        var stopped = await probe.SendAsync(ProbeCommand.Branch, target: anchor,
-            tracePath: tracePath, branchSide: side, branchInputIndex: inputIndex,
-            branchMasks: masks,
-            timeout: TimeSpan.FromSeconds(30));
+        ProbeSnapshot stopped;
+        try
+        {
+            stopped = await probe.SendAsync(ProbeCommand.Branch, target: anchor,
+                tracePath: tracePath, branchSide: side, branchInputIndex: inputIndex,
+                branchMasks: masks, timeout: TimeSpan.FromSeconds(30));
+        }
+        catch (IOException) when (permitInactiveTail)
+        {
+            var terminal = probe.Read();
+            if (terminal.Status != -5 || terminal.MatchState is not (3 or 5) ||
+                terminal.Sequence != terminal.Acknowledged) throw;
+            stopped = await probe.SendAsync(ProbeCommand.Pause);
+        }
         var seekMs = timer.ElapsedMilliseconds - prepareMs;
-        if (stopped.Status != 3 || stopped.Ordinal != anchor + masks.Count)
+        if (stopped.Status != 3 || stopped.Ordinal > anchor + masks.Count || stopped.Ordinal <= anchor ||
+            !permitInactiveTail && stopped.Ordinal != anchor + masks.Count)
             throw new IOException("快照分支没有停在目标帧。");
         var session = SessionLoader.LoadSimulationTrace(branchPath, header, tracePath,
             baselinePrefix: baseline.Frames, firstChangedFrame: anchor,
             tailOnly: true);
         var parseMs = timer.ElapsedMilliseconds - prepareMs - seekMs;
-        if (session.Frames.Count != anchor + masks.Count + 1)
+        if (session.Frames.Count != stopped.Ordinal + 1)
             throw new InvalidDataException("快照分支轨迹帧数不完整。");
         if (!ReplayBranchRunner.SameState(baseline.Frames[anchor], session.Frames[anchor]))
             throw new InvalidDataException("快照分支起点与实机基线不一致。");
         var matched = 0;
-        for (var i = 0; i < masks.Count; i++)
-            if (session.Frames[anchor + i + 1].Side(side).Input == masks[i]) matched++;
-        if (matched != masks.Count)
+        var inactiveTail = false;
+        for (var i = 0; i < stopped.Ordinal - anchor; i++)
+        {
+            var frame = session.Frames[anchor + i + 1];
+            inactiveTail |= frame.MatchState != 2 || frame.Round != session.Frames[anchor].Round;
+            if (frame.Side(side).Input == masks[i]) matched++;
+            else if (!permitInactiveTail || !inactiveTail)
+                throw new InvalidDataException($"快照输入在对战帧 {frame.Ordinal} 与预期不一致。");
+        }
+        if (!permitInactiveTail && matched != masks.Count)
             throw new InvalidDataException(
                 $"快照输入接管未通过逐帧验证：{matched}/{masks.Count}；不能用于逃压判定。");
         return new ReplayBranchResult(session, branchPath, anchor, stopped.Ordinal,

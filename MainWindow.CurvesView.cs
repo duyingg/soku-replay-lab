@@ -4,6 +4,7 @@ using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Shapes;
+using System.Windows.Threading;
 
 namespace SokuReplayLab;
 
@@ -246,9 +247,29 @@ public sealed partial class MainWindow
 
     private void RegisterCurve(Canvas canvas, Action draw)
     {
-        curveDraws.Add(draw);
-        canvas.SizeChanged += (_, _) => draw();
-        canvas.Loaded += (_, _) => draw();
+        var pending = false;
+        double drawnWidth = -1;
+        var drawnStart = -1;
+        var drawnFrames = -1;
+        void RequestDraw()
+        {
+            if (pending || canvas.IsLoaded && !canvas.IsVisible || canvas.ActualWidth <= 0) return;
+            pending = true;
+            Dispatcher.BeginInvoke(new Action(() => {
+                pending = false;
+                if (canvas.IsLoaded && !canvas.IsVisible || canvas.ActualWidth <= 0 ||
+                    drawnWidth == canvas.ActualWidth && drawnStart == curveStartFrame &&
+                    drawnFrames == curveWindowFrames) return;
+                drawnWidth = canvas.ActualWidth;
+                drawnStart = curveStartFrame;
+                drawnFrames = curveWindowFrames;
+                draw();
+            }), DispatcherPriority.Render);
+        }
+        curveDraws.Add(RequestDraw);
+        canvas.SizeChanged += (_, args) => { if (args.WidthChanged) RequestDraw(); };
+        canvas.Loaded += (_, _) => RequestDraw();
+        canvas.IsVisibleChanged += (_, _) => { if (canvas.IsVisible) RequestDraw(); };
     }
 
     private void DrawCurveRounds(Canvas canvas, RoundMark[] rounds, int count,

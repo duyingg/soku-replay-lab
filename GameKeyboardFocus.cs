@@ -139,6 +139,11 @@ public sealed class GameKeyboardFocus : IDisposable
         owner.Activate();
         SetFocus(new WindowInteropHelper(owner).Handle);
         owner.Focus();
+        // The game's deactivation handler can overwrite its activation gate.
+        // Restore replay-mode acquisition after all focus messages, otherwise
+        // the scene loop may stop before it can acknowledge the next Load.
+        if (IsWindow(game))
+            SendMessageTimeoutW(game, 0x8000 + 0x524, 0, 0, 2, 1000, out _);
     }
     public void Dispose()
     {

@@ -1,4 +1,4 @@
-using System.Windows;
+﻿using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 
@@ -40,7 +40,7 @@ public sealed partial class MainWindow
         row.Children.Add(Button("更改按键", EditExitTakeoverKey));
         row.Children.Add(Button("恢复 Esc", () => { SetExitTakeoverKey(Key.Escape); Render(); }));
         content.Children.Add(Card("快捷键", Vertical(row,
-            Text("只在接管游戏时生效，按下后将键盘焦点收回复盘程序。支持单个按键，更改会自动保存。", 12, Muted),
+            Text("只在接管游戏时生效，按下后收回键盘，并恢复接管前 REP 的位置、保持暂停。支持单个按键，更改会自动保存。", 12, Muted),
             Text("接管期间仅保留这里设置的退出键，其余按键交给游戏及 MOD 处理；不会修改游戏键位。", 12, Muted))));
     }
 

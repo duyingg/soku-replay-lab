@@ -18,9 +18,11 @@ public sealed class ProbeClient : IDisposable
 {
     private const int Size = 1080;
     private const int Magic = 0x524c5031;
-    private const int Version = 6;
+    private const int Version = 8;
     private readonly MemoryMappedFile map;
     private readonly MemoryMappedViewAccessor view;
+    private readonly object commandGate = new();
+    private readonly Process gameProcess;
     private bool disposed;
 
     [DllImport("kernel32.dll")]
@@ -38,16 +40,22 @@ public sealed class ProbeClient : IDisposable
             view.Dispose(); map.Dispose();
             throw new InvalidDataException("探针控制协议版本不匹配，需要重新启动游戏并接入新版探针。");
         }
+        try { gameProcess = Process.GetProcessById(pid); }
+        catch (ArgumentException ex)
+        {
+            view.Dispose(); map.Dispose();
+            throw new IOException("游戏进程已退出，无法连接探针。", ex);
+        }
     }
 
-    private static string Name(int pid) => $@"Local\ReplayLabProbeV6_{pid}";
+    private static string Name(int pid) => $@"Local\ReplayLabProbeV8_{pid}";
 
     public static ProbeClient? TryOpen(int pid)
     {
         try { return new ProbeClient(MemoryMappedFile.OpenExisting(Name(pid)), pid); }
         catch (FileNotFoundException)
         {
-            foreach (var version in new[] { 5, 4, 3 })
+            foreach (var version in new[] { 7, 6, 5, 4, 3 })
             {
                 try
                 {
@@ -107,11 +115,15 @@ public sealed class ProbeClient : IDisposable
 
     public ProbeSnapshot Read()
     {
-        ObjectDisposedException.ThrowIf(disposed, this);
-        if (view.ReadInt32(0) != Magic || view.ReadInt32(4) != Version)
-            throw new InvalidDataException("探针控制通道已失效。");
-        return new(view.ReadInt32(8), view.ReadInt32(12), view.ReadInt32(20),
-            view.ReadInt32(24), view.ReadInt32(28), view.ReadInt32(32), view.ReadInt32(36));
+        lock (commandGate)
+        {
+            ObjectDisposedException.ThrowIf(disposed, this);
+            if (gameProcess.HasExited) throw new IOException("游戏进程已退出，探针控制已断开。");
+            if (view.ReadInt32(0) != Magic || view.ReadInt32(4) != Version)
+                throw new InvalidDataException("探针控制通道已失效。");
+            return new(view.ReadInt32(8), view.ReadInt32(12), view.ReadInt32(20),
+                view.ReadInt32(24), view.ReadInt32(28), view.ReadInt32(32), view.ReadInt32(36));
+        }
     }
 
     public async Task<ProbeSnapshot> SendAsync(ProbeCommand command, int target = -1,
@@ -121,48 +133,57 @@ public sealed class ProbeClient : IDisposable
         int branchInputIndex = -1,
         IReadOnlyList<ushort>? branchMasks = null)
     {
-        ObjectDisposedException.ThrowIf(disposed, this);
-        var before = Read();
-        if (!supersedePending && before.Sequence != before.Acknowledged)
-            throw new InvalidOperationException("上一条探针命令尚未完成。");
-        if (command == ProbeCommand.Load)
+        int sequence;
+        // Serialize publication, but let Release supersede a command whose
+        // acknowledgement is still pending on the game thread.
+        lock (commandGate)
         {
-            if (replayPath is null || tracePath is null || !File.Exists(replayPath))
-                throw new FileNotFoundException("载入命令需要存在的 REP 和轨迹输出路径。");
-            WriteAnsi(40, replayPath);
-            WriteAnsi(560, tracePath);
+            ObjectDisposedException.ThrowIf(disposed, this);
+            cancellationToken.ThrowIfCancellationRequested();
+            var before = Read();
+            sequence = checked(before.Sequence + 1);
+            if (!supersedePending && before.Sequence != before.Acknowledged)
+                throw new InvalidOperationException("上一条探针命令尚未完成。");
+            if (command == ProbeCommand.Load)
+            {
+                if (replayPath is null || tracePath is null || !File.Exists(replayPath))
+                    throw new FileNotFoundException("载入命令需要存在的 REP 和轨迹输出路径。");
+                WriteAnsi(40, replayPath);
+                WriteAnsi(560, tracePath);
+            }
+            if (command == ProbeCommand.Branch)
+            {
+                if (branchSide is not (0 or 1) || branchInputIndex < 0 ||
+                    branchMasks is null || branchMasks.Count is < 1 or > 250 ||
+                    tracePath is null)
+                    throw new ArgumentException("快照分支需要玩家侧、输入和轨迹路径。");
+                var payload = new byte[520];
+                BitConverter.TryWriteBytes(payload.AsSpan(0, 4), branchSide);
+                BitConverter.TryWriteBytes(payload.AsSpan(4, 4), branchMasks.Count);
+                BitConverter.TryWriteBytes(payload.AsSpan(8, 4), branchInputIndex);
+                for (var i = 0; i < branchMasks.Count; i++)
+                    BitConverter.TryWriteBytes(payload.AsSpan(12 + i * 2, 2), branchMasks[i]);
+                view.WriteArray(40, payload, 0, payload.Length);
+                WriteAnsi(560, tracePath);
+            }
+            if (command == ProbeCommand.RestoreState)
+            {
+                view.Write(40, tracePath is null ? 0 : 1);
+                if (tracePath is not null) WriteAnsi(560, tracePath);
+            }
+            view.Write(28, target);
+            view.Write(16, (int)command);
+            Thread.MemoryBarrier();
+            view.Write(8, sequence);
         }
-        if (command == ProbeCommand.Branch)
-        {
-            if (branchSide is not (0 or 1) || branchInputIndex < 0 ||
-                branchMasks is null || branchMasks.Count is < 1 or > 250 ||
-                tracePath is null)
-                throw new ArgumentException("快照分支需要玩家侧、输入和轨迹路径。");
-            var payload = new byte[520];
-            BitConverter.TryWriteBytes(payload.AsSpan(0, 4), branchSide);
-            BitConverter.TryWriteBytes(payload.AsSpan(4, 4), branchMasks.Count);
-            BitConverter.TryWriteBytes(payload.AsSpan(8, 4), branchInputIndex);
-            for (var i = 0; i < branchMasks.Count; i++)
-                BitConverter.TryWriteBytes(payload.AsSpan(12 + i * 2, 2), branchMasks[i]);
-            view.WriteArray(40, payload, 0, payload.Length);
-            WriteAnsi(560, tracePath);
-        }
-        if (command == ProbeCommand.RestoreState)
-        {
-            view.Write(40, tracePath is null ? 0 : 1);
-            if (tracePath is not null) WriteAnsi(560, tracePath);
-        }
-        view.Write(28, target);
-        view.Write(16, (int)command);
-        Thread.MemoryBarrier();
-        var sequence = checked(before.Sequence + 1);
-        view.Write(8, sequence);
         var limit = Stopwatch.StartNew();
         var maximum = timeout ?? TimeSpan.FromSeconds(command == ProbeCommand.Seek ? 90 : 15);
         while (limit.Elapsed < maximum)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var state = Read();
+            if (state.Sequence != sequence)
+                throw new OperationCanceledException($"探针命令 {command} 已被后续命令替代。");
             if (state.Acknowledged == sequence)
             {
                 if (state.Status < 0)
@@ -198,10 +219,14 @@ public sealed class ProbeClient : IDisposable
 
     public void Dispose()
     {
-        if (disposed) return;
-        disposed = true;
-        view.Dispose();
-        map.Dispose();
+        lock (commandGate)
+        {
+            if (disposed) return;
+            disposed = true;
+            view.Dispose();
+            map.Dispose();
+            gameProcess.Dispose();
+        }
     }
 
     public static async Task ProtocolSmokeAsync()
@@ -221,6 +246,20 @@ public sealed class ProbeClient : IDisposable
         var result = await command;
         if (result.Status != 3 || result.Acknowledged != 1)
             throw new Exception("探针确认字段不一致。");
+        using (var cancelled = new CancellationTokenSource())
+        {
+            cancelled.Cancel();
+            try
+            {
+                await client.SendAsync(ProbeCommand.Seek, target: 999,
+                    cancellationToken: cancelled.Token);
+                throw new Exception("已取消的探针命令仍然执行。");
+            }
+            catch (OperationCanceledException) when (cancelled.IsCancellationRequested) { }
+            if (peer.ReadInt32(8) != 1 || peer.ReadInt32(16) != (int)ProbeCommand.Pause ||
+                peer.ReadInt32(28) != -1)
+                throw new Exception("已取消的探针命令修改了共享通道。");
+        }
         var release = client.ReleaseAsync();
         await Task.Delay(50);
         if (peer.ReadInt32(16) != (int)ProbeCommand.Release || peer.ReadInt32(8) != 2)
@@ -229,5 +268,23 @@ public sealed class ProbeClient : IDisposable
         peer.Write(12, 2);
         if ((await release).Status != 0)
             throw new Exception("探针释放确认字段不一致。");
+        var pending = client.SendAsync(ProbeCommand.Seek, target: 999);
+        try
+        {
+            await client.SendAsync(ProbeCommand.Pause);
+            throw new Exception("未确认命令被普通命令覆盖。");
+        }
+        catch (InvalidOperationException) { }
+        if (peer.ReadInt32(8) != 3 || peer.ReadInt32(16) != (int)ProbeCommand.Seek || peer.ReadInt32(28) != 999)
+            throw new Exception("拒绝重入后控制通道被修改。");
+        var interruptedRelease = client.ReleaseAsync();
+        var replaced = false;
+        try { await pending; }
+        catch (OperationCanceledException) { replaced = true; }
+        if (!replaced) throw new Exception("被释放命令替代的定位仍在等待。");
+        peer.Write(20, 0);
+        peer.Write(12, 4);
+        if ((await interruptedRelease).Acknowledged != 4)
+            throw new Exception("抢占后的释放命令未确认。");
     }
 }

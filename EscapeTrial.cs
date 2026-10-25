@@ -1,11 +1,6 @@
 namespace SokuReplayLab;
 
-public sealed record EscapeVerdict(string Result, string Reason);
-public sealed record EscapeTrialResult(int Anchor, int Defender, string Move,
-    EscapeVerdict Verdict, ReplaySession Original, string ReplayPath,
-    int End, int MatchedInputFrames);
-
-/// <summary>Plans a small set of explicit inputs and judges only observed engine outcomes.</summary>
+/// <summary>Legacy diagnostic fixtures. The application uses PressureEscapeSimulation.</summary>
 public static class EscapeTrial
 {
     public static readonly string[] Moves = ["4A", "2A", "8", "28", "B", "2B", "2C",
